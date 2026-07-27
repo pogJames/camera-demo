@@ -1,0 +1,15 @@
+[Unit]
+Description=NPU camera object detection
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/npu
+EnvironmentFile=/opt/npu/.env
+ExecStart=/usr/bin/python3 /opt/npu/detect.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
