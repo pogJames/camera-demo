@@ -7,7 +7,6 @@ One place that hides every runtime difference between the dev box and the board:
 The tflite Python API is imported by preference:
   1. tflite_runtime            (standard on the NXP board image)
   2. ai_edge_litert            (the modern successor; what pip installs on py3.12)
-  3. tensorflow.lite           (last-resort fallback for a full-TF dev box)
 """
 
 import numpy as np
@@ -25,22 +24,12 @@ def _import_tflite():
         return tflite, "ai_edge_litert"
     except ImportError:
         pass
-    import tensorflow.lite as tflite  # noqa: F401  (raises if TF absent too)
-    return tflite, "tensorflow.lite"
 
 
-ETHOSU_DELEGATE = "/usr/lib/libethosu_delegate.so"
+ETHOSU_DELEGATE = "/usr/local/lib/libethosu_delegate.so"
 
 
 def make_interpreter(model_path, use_npu, log=print):
-    """Build and allocate a tflite Interpreter.
-
-    use_npu=True loads the Ethos-U delegate explicitly. Do NOT pass a
-    _vela.tflite without use_npu=True: the unresolved 'ethos-u' custom op will
-    fail to prepare. Conversely a plain (non-vela) model with use_npu=True will
-    simply run every op on CPU (the delegate delegates zero nodes) — harmless
-    but pointless.
-    """
     tflite, backend = _import_tflite()
     log(f"[interp] tflite backend: {backend}")
     log(f"[interp] model: {model_path}  use_npu={use_npu}")

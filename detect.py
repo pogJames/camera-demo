@@ -11,7 +11,7 @@ Threads:
                       cached and reused for in-between frames (rate decoupling).
   - HTTP (uvicorn)  : serves / , /stream , /detections.
 
-Everything platform-specific is an env var (see config.py / .env.example).
+Everything platform-specific is hardcoded in config.py (single source of truth).
 """
 
 import threading
@@ -43,9 +43,8 @@ class FrameStore:
     def __init__(self):
         self._lock = threading.Lock()
         self._frame = None          # latest full-res BGR frame
-        self._seq = 0               # increments on every new frame
-        self._detections = []       # most recent detections (list of dicts)
-        self._det_seq = -1          # frame seq the detections were computed on
+        self._seq = 0
+        self._detections = []
 
     def put_frame(self, frame):
         with self._lock:
@@ -59,10 +58,9 @@ class FrameStore:
                 return None, self._seq
             return self._frame.copy(), self._seq
 
-    def set_detections(self, dets, seq):
+    def set_detections(self, dets):
         with self._lock:
             self._detections = dets
-            self._det_seq = seq
 
     def get_detections(self):
         with self._lock:
@@ -73,9 +71,7 @@ store = FrameStore()
 _stop = threading.Event()
 
 
-# --------------------------------------------------------------------------- #
 # Capture
-# --------------------------------------------------------------------------- #
 def _iter_mjpeg(resp, chunk=8192):
     """Yield complete JPEG byte blobs from a multipart/x-mixed-replace stream.
 
@@ -141,9 +137,7 @@ def capture_loop():
     print("[capture] stopped")
 
 
-# --------------------------------------------------------------------------- #
 # Inference
-# --------------------------------------------------------------------------- #
 class Detector:
     """Wraps the interpreter for the built-in-postprocess (4-output) model.
 
@@ -166,10 +160,10 @@ class Detector:
         pair = [o for o in self.outs if len(o["shape"]) == 2]
         if not (len(boxes) == 1 and len(count) == 1 and len(pair) == 2):
             raise RuntimeError(
-                f"Expected a 4-output built-in-postprocess model; got shapes "
+                f"Wrong model; got shapes "
                 f"{[list(o['shape']) for o in self.outs]}"
             )
-        pair.sort(key=lambda o: o["index"])   # lower index = classes, higher = scores
+        pair.sort(key=lambda o: o["index"])
         self.box_idx = boxes[0]["index"]
         self.class_idx = pair[0]["index"]
         self.score_idx = pair[1]["index"]
@@ -193,7 +187,6 @@ def inference_loop(detector):
     """Run detection on every INFER_EVERY-th new frame; cache the result."""
     last_seq = -1
     counter = 0
-    ema_ms = None
     while not _stop.is_set():
         frame, seq = store.get_frame()
         if frame is None or seq == last_seq:
@@ -209,17 +202,14 @@ def inference_loop(detector):
         except Exception as e:
             print(f"[infer] error: {e!r}")
             continue
-        store.set_detections(dets, seq)
+        store.set_detections(dets)
         dt = (time.time() - t0) * 1000
-        ema_ms = dt if ema_ms is None else 0.9 * ema_ms + 0.1 * dt
         if counter % (config.INFER_EVERY * 30) == 0:
-            print(f"[infer] {len(dets)} dets, {dt:.1f}ms (ema {ema_ms:.1f}ms)")
+            print(f"[infer] {len(dets)} dets, {dt:.1f}ms")
     print("[infer] stopped")
 
 
-# --------------------------------------------------------------------------- #
 # Annotation
-# --------------------------------------------------------------------------- #
 _COLORS = {}
 
 
@@ -237,16 +227,14 @@ def annotate(frame, dets, labels):
         name = labels[d["class_id"]] if d["class_id"] < len(labels) else str(d["class_id"])
         cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2)
         text = f"{name} {d['score']:.2f}"
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1, 1)
         cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 2, y1), col, -1)
         cv2.putText(frame, text, (x1 + 1, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 1, cv2.LINE_AA)
     return frame
 
 
-# --------------------------------------------------------------------------- #
 # HTTP server (FastAPI)
-# --------------------------------------------------------------------------- #
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 
@@ -284,8 +272,6 @@ def _mjpeg_generator():
             continue
         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
                + jpg.tobytes() + b"\r\n")
-        # No sleep needed here: the seq-gate above already paces us to the
-        # source frame rate (one encode per new frame).
 
 
 @app.get("/stream")
@@ -306,9 +292,7 @@ def detections():
     return JSONResponse(out)
 
 
-# --------------------------------------------------------------------------- #
 # Entrypoint
-# --------------------------------------------------------------------------- #
 def main():
     global _labels
     print("[config]\n" + config.summary())

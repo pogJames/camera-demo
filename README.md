@@ -8,12 +8,9 @@ boxes, and serves the annotated video to any browser on the LAN via a plain
 Pure Python: `requests` (capture) + `opencv` (decode/draw) + a tflite interpreter
 (inference) + `FastAPI`/`uvicorn` (serve).
 
-## Models — two supported, branch auto-detected
+## Model: `ssd_mobilenet_v2_coco_quant_postprocess.tflite` (INT8, NPU-ready)
 
-The app inspects the model's **output-tensor count** at load and dispatches to
-the right postprocess path automatically. Just set `MODEL_PATH`.
-
-### Default: `ssd_mobilenet_v2_coco_quant_postprocess.tflite` (INT8, NPU-ready)
+The app supports one model: the INT8 built-in-postprocess SSD-MobileNetV2.
 
 **4 output tensors** = built-in `TFLite_Detection_PostProcess` — boxes are
 already decoded + NMS'd (incl. cross-class NMS) inside the graph.
@@ -30,29 +27,21 @@ already decoded + NMS'd (incl. cross-class NMS) inside the graph.
 class offset** so ids index directly into `coco_labels_list.txt` (line 0 =
 `???` background). This is INT8, so it **Vela-compiles for the Ethos-U NPU**
 (the detection-postprocess op falls back to the A55 CPU — expected, cheap).
-The preprocessor's default `INPUT_MEAN/STD=127.5` already produces the raw
-uint8 pixels this model wants (via the model's own quant params).
-
-### Alternate: `ssd_mobilenet_v2_coco.tflite` (float32, CPU only)
-
-**2 output tensors** = raw regressions + logits. `postprocess()` anchor-decodes
-against `box_priors.txt` (`[4,1917]` = ycenter,xcenter,h,w) with `10.0/5.0`
-variances, softmaxes 91 classes, per-class NMS. Class ids index the labels file
-directly (offset 0). **Float, so CPU only — cannot be Vela-compiled.** Kept as a
-fallback; the default model above is preferred for the board.
+`preprocess.to_input_tensor` normalizes with the SSD `mean/std=127.5` and then
+re-quantizes with the model's own quant params — the round-trip reproduces the
+raw uint8 pixels this model wants.
 
 ## Files
 
 | file | role |
 |---|---|
 | `detect.py` | main app: capture thread + inference thread + FastAPI server |
-| `preprocess.py` | letterbox resize + config-driven normalization + dtype/quant conversion |
-| `postprocess.py` | both paths: built-in-postprocess reader + raw anchor-decode/NMS |
+| `preprocess.py` | letterbox resize + normalization + dtype/quant conversion |
+| `postprocess.py` | built-in-postprocess reader (threshold + class-offset + unletterbox) |
 | `interp.py` | interpreter factory, optional Ethos-U delegate loader |
-| `config.py` | all env-var config (single source of truth) |
+| `config.py` | all config, hardcoded (single source of truth — edit this file) |
 | `mock_server.py` | dev-box MJPEG server (loops a video / JPEGs / a still) |
 | `npu-python.service` | systemd unit for the board |
-| `.env.example` | documents every env var |
 
 ## Dev box (WSL / x86 Linux, Python 3.12)
 
@@ -71,7 +60,7 @@ Run the mock camera + the app in two terminals:
 # terminal 1 — serve any local media as MJPEG at :8080
 python3 mock_server.py path/to/clip.mp4        # or a folder of *.jpg, or one still
 
-# terminal 2 — defaults already point at the mock stream + CPU + float model
+# terminal 2 — config.py defaults already point at the mock stream + CPU
 python3 detect.py
 ```
 
@@ -92,19 +81,18 @@ there; only the pure-Python deps (`numpy`, `opencv`, `requests`, `fastapi`,
 sudo mkdir -p /opt/npu
 sudo cp detect.py preprocess.py postprocess.py interp.py config.py /opt/npu/
 sudo cp -r tflite_model /opt/npu/            # include the *_vela.tflite here
-sudo cp .env.example /opt/npu/.env           # then edit /opt/npu/.env
 ```
 
-Edit `/opt/npu/.env` for the board:
+Edit `/opt/npu/config.py` for the board:
 
-```ini
-STREAM_URL=https://192.168.10.1/streaming/stream3/video.mjpeg
+```python
+STREAM_URL  = "https://192.168.10.1/streaming/stream3/video.mjpeg"
 # Vela-compile the INT8 quant_postprocess model, then point here:
-MODEL_PATH=/opt/npu/tflite_model/ssd_mobilenet_v2_coco_quant_postprocess_vela.tflite
-USE_NPU=1
-CAM_USER=<user>
-CAM_PASS=<pass>
-VERIFY_TLS=0
+MODEL_PATH  = "/opt/npu/tflite_model/ssd_mobilenet_v2_coco_quant_postprocess_vela.tflite"
+USE_NPU     = True
+CAM_USER    = "<user>"
+CAM_PASS    = "<pass>"
+VERIFY_TLS  = False
 ```
 
 The INT8 `ssd_mobilenet_v2_coco_quant_postprocess.tflite` is the one to run
@@ -127,16 +115,17 @@ init lines — confirm the log shows nodes delegated to the NPU. Then open
 
 ### Tuning (on the board only)
 
-`INFER_EVERY` (default 3) controls how often the model runs; frames in between
-reuse the last detections. Tune it — plus the camera's `stream3`
-resolution/fps — **on the board**, not the dev box: dev-CPU timings don't
-transfer. `[infer]` log lines report per-inference latency.
+`INFER_EVERY` in `config.py` (default 3) controls how often the model runs;
+frames in between reuse the last detections. Tune it — plus the camera's
+`stream3` resolution/fps — **on the board**, not the dev box: dev-CPU timings
+don't transfer. `[infer]` log lines report per-inference latency.
 
 ## Notes / gotchas
 
-- **Never** load a `_vela.tflite` without `USE_NPU=1` — the unresolved `ethos-u`
-  custom op fails to prepare. The dev box uses the plain (float) model.
-- `VERIFY_TLS=0` (verify=False) is acceptable only on the isolated camera link.
+- **Never** load a `_vela.tflite` without `USE_NPU=True` — the unresolved
+  `ethos-u` custom op fails to prepare. The dev box runs the plain (non-vela)
+  INT8 model with `USE_NPU=False` (every op on CPU).
+- `VERIFY_TLS=False` (verify=False) is acceptable only on the isolated camera link.
 - The capture path is **latest-frame-wins**: it never queues a backlog, so
   end-to-end latency stays bounded if inference or the network stalls.
 - No HTTP auth on the server — intended for an isolated LAN only.
