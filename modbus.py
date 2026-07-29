@@ -4,14 +4,9 @@ import time
 
 
 class LampBank:
-    def __init__(self, enable, port, baud, parity, stopbits, bytesize, slave,
-                 refresh_secs=2.0, log=print):
+    def __init__(self, enable, port, slave, refresh_secs=2.0, log=print):
         self.enable = enable
         self.port = port
-        self.baud = baud
-        self.parity = parity
-        self.stopbits = stopbits
-        self.bytesize = bytesize
         self.slave = slave
         self.refresh_secs = refresh_secs
         self.log = log
@@ -53,15 +48,14 @@ class LampBank:
             return False
         try:
             from pymodbus.client import ModbusSerialClient
-            c = ModbusSerialClient(port=self.port, baudrate=self.baud,
-                                   parity=self.parity, stopbits=self.stopbits,
-                                   bytesize=self.bytesize, timeout=1.0)
+            c = ModbusSerialClient(port=self.port, baudrate=9600, parity="N",
+                                   stopbits=1, bytesize=8, timeout=1.0)  # 9600 8N1
             if not c.connect():
                 raise OSError(f"cannot open {self.port}")
             self._client = c
             self._last = {}
             self._backoff = 1.0
-            self.log(f"[modbus] connected {self.port} @ {self.baud}")
+            self.log(f"[modbus] connected {self.port} @ 9600 8N1")
             return True
         except Exception as e:
             self._next_try = now + self._backoff

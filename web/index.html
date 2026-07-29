@@ -10,11 +10,19 @@
   <div class="wrap">
     <div class="video"><img src="/stream" alt="live stream"></div>
     <div class="panel">
-      <h1>Assembly sequence</h1>
+      <header class="panel-head">
+        <h1>ASSEMBLY SEQUENCE</h1>
+      </header>
       <div id="banner" class="banner hidden"></div>
-      <ul id="steps" class="steps"></ul>
-      <div id="lamps" class="lamps"></div>
-      <button onclick="doReset()">Reset</button>
+      <section class="section">
+        <div class="label">Steps</div>
+        <ul id="steps" class="steps"></ul>
+      </section>
+      <section class="section">
+        <div class="label">Indicators</div>
+        <div id="lamps" class="lamps"></div>
+      </section>
+      <button onclick="doReset()">Reset sequence</button>
     </div>
   </div>
   <script src="/static/app.js"></script>

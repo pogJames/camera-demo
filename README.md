@@ -70,15 +70,18 @@ Open **http://localhost:8000/**. Endpoints:
 - `GET /detections` — JSON `{label, class_id, score, box}`
 - `GET /state` — current demo state `{steps, current, complete, fault}`
 - `GET /events` — Server-Sent-Events stream of demo state (drives the panel)
+- `GET /log/{i}` — proof JPEG snapshotted when step `i` completed (404 if none)
 - `POST /reset` — reset the sequence to step 1 (also clears a fault)
 
 ## Guided-sequence demo
 
-Present the objects in `config.DEMO_STEPS` (default `bottle → cell phone →
+Present the objects in `config.DEMO_STEPS` (default `bottle → phone →
 scissors`) to the camera in order. Each confirmed object advances the side panel
 and lights its Modbus lamp; showing the wrong object freezes the sequence and
-lights the fault lamp until it's removed. The run auto-resets `AUTO_RESET_SECS`
-after completion, or on the Reset button. Detections must hold for
+lights the fault lamp until it's removed. Each completed step keeps a **proof
+snapshot** (the annotated frame that confirmed it), reachable via a "view" link
+on the step (`/log/{i}`). The run auto-resets `AUTO_RESET_SECS` after completion,
+or on the Reset button (which also clears the proofs). Detections must hold for
 `CONFIRM_FRAMES` inference cycles to count (debounce). With `MODBUS_ENABLE=False`
 (dev-box default) the lamp writes are just logged, so the whole demo runs with no
 gateway attached — no `pymodbus` needed until the board. Run the pure-logic
@@ -108,7 +111,7 @@ CAM_USER    = "<user>"
 CAM_PASS    = "<pass>"
 # Modbus-RTU indicator lamps:
 MODBUS_ENABLE = True
-MODBUS_PORT   = "/dev/ttyUSB0"   # + MODBUS_BAUD / PARITY / SLAVE to match the gateway
+MODBUS_PORT   = "/dev/ttyUSB0"   # 9600 8N1 hardcoded; set MODBUS_SLAVE to match the gateway
 ```
 
 Vela-compile the INT8 model (`vela ...`) to get the `_vela.tflite`. On load,
@@ -131,7 +134,7 @@ per-inference latency.
   inference or the network stalls.
 - No HTTP auth on the server — isolated LAN only.
 - `DEMO_STEPS` strings must match lines in `coco_labels_list.txt` exactly (e.g.
-  `cell phone`, not `phone`) — they're what the model emits.
+  `phone`, not `phone`) — they're what the model emits.
 - Lamps are Modbus **holding registers** written `1`/`0` (`write_register`), not
   coils — `STEP_REGS` / `FAULT_REG` are register addresses (see the gateway's Li
   light map).

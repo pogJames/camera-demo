@@ -1,11 +1,14 @@
 function render(s) {
   const stepsEl = document.getElementById('steps');
   stepsEl.innerHTML = '';
-  s.steps.forEach(st => {
+  s.steps.forEach((st, i) => {
     const li = document.createElement('li');
     li.className = 'step ' + st.state;
+    const proof = st.state === 'done'
+      ? '<a class="proof" href="/log/' + i + '" target="_blank">view</a>'
+      : '';
     li.innerHTML = '<span class="dot"></span><span class="name">' +
-      st.label + '</span><span class="tick">&#10003;</span>';
+      st.label + '</span>' + proof + '<span class="tick">&#10003;</span>';
     stepsEl.appendChild(li);
   });
 

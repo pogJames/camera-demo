@@ -6,13 +6,12 @@ import time
 
 class DemoController:
     def __init__(self, steps, confirm_frames, auto_reset_secs,
-                 step_regs, fault_reg, done_reg=None):
+                 step_regs, fault_reg):
         self.steps = list(steps)
         self.confirm_frames = max(1, int(confirm_frames))
         self.auto_reset_secs = auto_reset_secs
         self.step_regs = list(step_regs)
         self.fault_reg = fault_reg
-        self.done_reg = done_reg
         self._lock = threading.Lock()
         self._reset_locked()
 
@@ -36,8 +35,8 @@ class DemoController:
             if self._index >= n:
                 if self._done_at is None:
                     self._done_at = now
-                elif self.auto_reset_secs and now - self._done_at >= self.auto_reset_secs:
-                    self._reset_locked()
+#                elif self.auto_reset_secs and now - self._done_at >= self.auto_reset_secs:
+#                    self._reset_locked()
             else:
                 expected = self.steps[self._index]
                 completed = set(self.steps[:self._index])
@@ -87,6 +86,4 @@ class DemoController:
         regs = {addr: i < self._index for i, addr in enumerate(self.step_regs)}
         if self.fault_reg is not None:
             regs[self.fault_reg] = self._fault
-        if self.done_reg is not None:
-            regs[self.done_reg] = self._index >= len(self.steps)
         return regs

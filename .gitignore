@@ -1,9 +1,11 @@
 __pycache__
 .venv
+.pytest_cache
 
 data
 dev_files
-testings
 tflite_model
+tests
 
 CLAUDE.md
+openapi.yaml

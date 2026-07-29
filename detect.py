@@ -30,8 +30,12 @@ class FrameStore:
         self._frame = None
         self._seq = 0
         self._detections = []
+        self._infer_frame = None       # the frame the latest detections ran on
         self._det_seq = 0
         self._state = None
+        self._state_seq = 0
+        self._state_cond = threading.Condition(self._lock)
+        self._proofs = {}              # step index -> annotated JPEG bytes
 
     def put_frame(self, frame):
         with self._lock:
@@ -45,9 +49,10 @@ class FrameStore:
                 return None, self._seq
             return self._frame.copy(), self._seq
 
-    def set_detections(self, dets):
+    def set_detections(self, dets, frame=None):
         with self._lock:
             self._detections = dets
+            self._infer_frame = frame
             self._det_seq += 1
 
     def get_detections(self):
@@ -56,15 +61,42 @@ class FrameStore:
 
     def get_detections_seq(self):
         with self._lock:
-            return list(self._detections), self._det_seq
+            frame = None if self._infer_frame is None else self._infer_frame
+            return list(self._detections), frame, self._det_seq
+
+    def set_proof(self, idx, jpg):
+        with self._lock:
+            self._proofs[idx] = jpg
+
+    def get_proof(self, idx):
+        with self._lock:
+            return self._proofs.get(idx)
+
+    def clear_proofs(self):
+        with self._lock:
+            self._proofs.clear()
 
     def set_state(self, state):
         with self._lock:
+            if state == self._state:
+                return          # no change -> no seq bump, no wake (dedupe)
             self._state = state
+            self._state_seq += 1
+            self._state_cond.notify_all()
 
     def get_state(self):
         with self._lock:
             return self._state
+
+    def wait_state(self, last_seq, timeout):
+        """Block until state_seq != last_seq (pushed by set_state) or timeout.
+
+        Returns (state, state_seq). Latest-wins: coalesces bursts into one wake.
+        """
+        with self._state_cond:
+            if self._state_seq == last_seq:
+                self._state_cond.wait(timeout)
+            return self._state, self._state_seq
 
 
 store = FrameStore()
@@ -184,7 +216,7 @@ def inference_loop(detector):
         except Exception as e:
             print(f"[infer] error: {e!r}")
             continue
-        store.set_detections(dets)
+        store.set_detections(dets, frame)
         dt = (time.time() - t0) * 1000
         if counter % (config.INFER_EVERY * 30) == 0:
             print(f"[infer] {len(dets)} dets, {dt:.1f}ms")
@@ -194,8 +226,9 @@ def inference_loop(detector):
 # Sequence control (decoupled from inference; owns the Modbus lamps)
 def control_loop(ctrl, lamps):
     last_seq = -1
+    last_current = 0
     while not _stop.is_set():
-        dets, seq = store.get_detections_seq()
+        dets, frame, seq = store.get_detections_seq()
         flush = _reset_flush.is_set()
         if seq == last_seq and not flush:
             _stop.wait(0.005)
@@ -212,7 +245,32 @@ def control_loop(ctrl, lamps):
             state, regs = ctrl.update(labels)
         store.set_state(state)
         lamps.apply(regs)
+
+        # Proof-of-item: on each newly completed step, save the frame that
+        # confirmed it. On reset (current drops) drop the stale proofs.
+        cur = state["current"]
+        if cur > last_current:
+            for i in range(last_current, cur):
+                _save_proof(i, ctrl.steps[i], frame, dets)
+        elif cur < last_current:
+            store.clear_proofs()
+        last_current = cur
     print("[control] stopped")
+
+
+def _save_proof(idx, label, frame, dets):
+    if frame is None:
+        return
+    img = frame.copy()
+    hits = [d for d in dets if d["class_id"] < len(_labels)
+            and _labels[d["class_id"]] == label]
+    annotate(img, hits, _labels)
+    h, w = img.shape[:2]
+    if w > 480:
+        img = cv2.resize(img, (480, round(h * 480 / w)))
+    ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, config.JPEG_QUALITY])
+    if ok:
+        store.set_proof(idx, jpg.tobytes())
 
 
 # Annotation
@@ -242,7 +300,7 @@ def annotate(frame, dets, labels):
 
 # HTTP server (FastAPI)
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="NPU camera detection")
@@ -297,18 +355,27 @@ def state():
     return JSONResponse(store.get_state() or {})
 
 
+@app.get("/log/{i}")
+def log(i: int):
+    jpg = store.get_proof(i)
+    if jpg is None:
+        return Response(status_code=404)
+    return Response(content=jpg, media_type="image/jpeg")
+
+
 @app.get("/events")
 def events():
     def gen():
-        last = None
+        last = -1
         while not _stop.is_set():
-            s = store.get_state()
-            if s is not None:
-                msg = json.dumps(s, separators=(",", ":"))
-                if msg != last:
-                    last = msg
-                    yield f"data: {msg}\n\n"
-            time.sleep(0.1)
+            # Push: blocks until control_loop's set_state() notifies (or 15s
+            # keepalive). No polling; latency is the notify itself.
+            s, seq = store.wait_state(last, timeout=15.0)
+            if seq != last and s is not None:
+                last = seq
+                yield f"data: {json.dumps(s, separators=(',', ':'))}\n\n"
+            else:
+                yield ": ping\n\n"
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
@@ -331,11 +398,10 @@ def main():
 
     _controller = controller.DemoController(
         config.DEMO_STEPS, config.CONFIRM_FRAMES, config.AUTO_RESET_SECS,
-        config.STEP_REGS, config.FAULT_REG, config.DONE_REG)
+        config.STEP_REGS, config.FAULT_REG)
     lamps = modbus.LampBank(
-        config.MODBUS_ENABLE, config.MODBUS_PORT, config.MODBUS_BAUD,
-        config.MODBUS_PARITY, config.MODBUS_STOPBITS, config.MODBUS_BYTESIZE,
-        config.MODBUS_SLAVE, config.MODBUS_REFRESH_SECS)
+        config.MODBUS_ENABLE, config.MODBUS_PORT, config.MODBUS_SLAVE,
+        config.MODBUS_REFRESH_SECS)
     st0, _ = _controller.snapshot()
     store.set_state(st0)
 
