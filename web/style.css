@@ -1,0 +1,38 @@
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; }
+
+.wrap { display: flex; flex-wrap: wrap; min-height: 100vh; }
+.video { flex: 1 1 640px; background: #000; display: flex; align-items: center; justify-content: center; }
+.video img { max-width: 100%; max-height: 100vh; display: block; }
+.panel { flex: 0 0 320px; padding: 1.2rem 1.4rem; display: flex; flex-direction: column; gap: 1rem; }
+h1 { font-size: 1.05rem; margin: 0; }
+
+.steps { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: .55rem; }
+.step { display: flex; align-items: center; gap: .7rem; padding: .6rem .8rem; border-radius: .6rem;
+        background: #1c1c1f; border: 1px solid #2a2a2e; }
+.step .dot { width: .9rem; height: .9rem; border-radius: 50%; background: #444; flex: 0 0 auto; }
+.step.active { border-color: #3a7afe; background: #16233f; }
+.step.active .dot { background: #3a7afe; box-shadow: 0 0 8px #3a7afe; }
+.step.done { border-color: #2f7d43; color: #9fe6b0; }
+.step.done .dot { background: #39c46a; }
+.step .name { flex: 1; text-transform: capitalize; }
+.step .tick { opacity: 0; font-weight: 700; color: #39c46a; }
+.step.done .tick { opacity: 1; }
+
+.banner { padding: .8rem 1rem; border-radius: .6rem; font-weight: 600; text-align: center; }
+.banner.hidden { display: none; }
+.banner.fault { background: #3a1414; color: #ff8a8a; border: 1px solid #7d2f2f;
+                animation: pulse 1s ease-in-out infinite; }
+.banner.done { background: #123320; color: #9fe6b0; border: 1px solid #2f7d43; }
+@keyframes pulse { 50% { background: #521c1c; } }
+
+.lamps { display: flex; gap: .8rem; align-items: center; flex-wrap: wrap; }
+.lamp { display: flex; flex-direction: column; align-items: center; gap: .3rem; font-size: .7rem; color: #999; }
+.lamp .bulb { width: 1.4rem; height: 1.4rem; border-radius: 50%; background: #333; border: 1px solid #444; }
+.lamp.on .bulb { background: #39c46a; box-shadow: 0 0 10px #39c46a; }
+.lamp.fault.on .bulb { background: #ff5a5a; box-shadow: 0 0 10px #ff5a5a; }
+
+button { margin-top: auto; padding: .7rem; border: 0; border-radius: .6rem; background: #2a2a2e;
+         color: #eee; font-size: .95rem; cursor: pointer; }
+button:hover { background: #37373d; }

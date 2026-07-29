@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NPU sequence demo</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="wrap">
+    <div class="video"><img src="/stream" alt="live stream"></div>
+    <div class="panel">
+      <h1>Assembly sequence</h1>
+      <div id="banner" class="banner hidden"></div>
+      <ul id="steps" class="steps"></ul>
+      <div id="lamps" class="lamps"></div>
+      <button onclick="doReset()">Reset</button>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

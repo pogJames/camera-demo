@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Smart-camera -> NPU object detection -> LAN browser stream. See CLAUDE.md."""
 
+import json
+import os
+import sys
 import threading
 import time
 import io
@@ -14,7 +17,9 @@ import urllib3
 import config
 import preprocess
 import postprocess
-from npu import get_npu
+import controller
+import modbus
+import interpreter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -25,6 +30,8 @@ class FrameStore:
         self._frame = None
         self._seq = 0
         self._detections = []
+        self._det_seq = 0
+        self._state = None
 
     def put_frame(self, frame):
         with self._lock:
@@ -41,14 +48,29 @@ class FrameStore:
     def set_detections(self, dets):
         with self._lock:
             self._detections = dets
+            self._det_seq += 1
 
     def get_detections(self):
         with self._lock:
             return list(self._detections)
 
+    def get_detections_seq(self):
+        with self._lock:
+            return list(self._detections), self._det_seq
+
+    def set_state(self, state):
+        with self._lock:
+            self._state = state
+
+    def get_state(self):
+        with self._lock:
+            return self._state
+
 
 store = FrameStore()
 _stop = threading.Event()
+_controller = None
+_reset_flush = threading.Event()   # /reset asks the control thread to push lamps off now
 
 
 # Capture
@@ -110,7 +132,7 @@ def capture_loop():
 # Inference
 class Detector:
     def __init__(self):
-        self.npu = get_npu(config.MODEL_PATH, config.USE_NPU)
+        self.npu = interpreter.get_npu(config.MODEL_PATH, config.USE_NPU)
         self.inp = self.npu.get_input_details()[0]
         self.outs = self.npu.get_output_details()
         self.input_size = int(self.inp["shape"][1])
@@ -169,6 +191,30 @@ def inference_loop(detector):
     print("[infer] stopped")
 
 
+# Sequence control (decoupled from inference; owns the Modbus lamps)
+def control_loop(ctrl, lamps):
+    last_seq = -1
+    while not _stop.is_set():
+        dets, seq = store.get_detections_seq()
+        flush = _reset_flush.is_set()
+        if seq == last_seq and not flush:
+            _stop.wait(0.005)
+            continue
+        last_seq = seq
+        if flush:
+            # ctrl was already reset by the HTTP handler; just push the off state,
+            # so the lamps clear even if the detection stream has stalled.
+            _reset_flush.clear()
+            state, regs = ctrl.snapshot()
+        else:
+            labels = {_labels[d["class_id"]] for d in dets
+                      if d["class_id"] < len(_labels)}
+            state, regs = ctrl.update(labels)
+        store.set_state(state)
+        lamps.apply(regs)
+    print("[control] stopped")
+
+
 # Annotation
 _COLORS = {}
 
@@ -196,22 +242,19 @@ def annotate(frame, dets, labels):
 
 # HTTP server (FastAPI)
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="NPU camera detection")
 _labels = []
 
-_INDEX_HTML = """<!doctype html><html><head><meta charset="utf-8">
-<title>NPU camera detection</title>
-<style>body{margin:0;background:#111;color:#eee;font-family:sans-serif;text-align:center}
-img{max-width:100%;height:auto}h1{font-size:1rem;padding:.5rem;margin:0}</style></head>
-<body><h1>NPU object detection &mdash; live</h1>
-<img src="/stream" alt="stream"></body></html>"""
+WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 def index():
-    return _INDEX_HTML
+    return FileResponse(os.path.join(WEB_DIR, "index.html"))
 
 
 def _mjpeg_generator():
@@ -249,24 +292,88 @@ def detections():
     return JSONResponse(out)
 
 
+@app.get("/state")
+def state():
+    return JSONResponse(store.get_state() or {})
+
+
+@app.get("/events")
+def events():
+    def gen():
+        last = None
+        while not _stop.is_set():
+            s = store.get_state()
+            if s is not None:
+                msg = json.dumps(s, separators=(",", ":"))
+                if msg != last:
+                    last = msg
+                    yield f"data: {msg}\n\n"
+            time.sleep(0.1)
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/reset")
+def reset():
+    if _controller is not None:
+        _controller.reset()
+        st, _ = _controller.snapshot()
+        store.set_state(st)
+        _reset_flush.set()   # control thread turns the lamps off on its next tick
+    return JSONResponse({"ok": True})
+
+
 # Entrypoint
 def main():
-    global _labels
+    global _labels, _controller
     print("[config]\n" + config.summary())
     detector = Detector()
     _labels = detector.labels
 
-    threading.Thread(target=capture_loop, name="capture", daemon=True).start()
-    threading.Thread(target=inference_loop, args=(detector,),
-                     name="infer", daemon=True).start()
+    _controller = controller.DemoController(
+        config.DEMO_STEPS, config.CONFIRM_FRAMES, config.AUTO_RESET_SECS,
+        config.STEP_REGS, config.FAULT_REG, config.DONE_REG)
+    lamps = modbus.LampBank(
+        config.MODBUS_ENABLE, config.MODBUS_PORT, config.MODBUS_BAUD,
+        config.MODBUS_PARITY, config.MODBUS_STOPBITS, config.MODBUS_BYTESIZE,
+        config.MODBUS_SLAVE, config.MODBUS_REFRESH_SECS)
+    st0, _ = _controller.snapshot()
+    store.set_state(st0)
+
+    threads = [
+        threading.Thread(target=capture_loop, name="capture", daemon=True),
+        threading.Thread(target=inference_loop, args=(detector,),
+                         name="infer", daemon=True),
+        threading.Thread(target=control_loop, args=(_controller, lamps),
+                         name="control", daemon=True),
+    ]
+    for t in threads:
+        t.start()
 
     import uvicorn
     print(f"[http] serving on 0.0.0.0:{config.HTTP_PORT} "
           f"(open http://<host>:{config.HTTP_PORT}/ )")
     try:
-        uvicorn.run(app, host="0.0.0.0", port=config.HTTP_PORT, log_level="warning")
+        uvicorn.run(app, host="0.0.0.0", port=config.HTTP_PORT, log_level="warning",
+                    timeout_graceful_shutdown=1)
     finally:
-        _stop.set()
+        _shutdown(threads, lamps)
+
+
+def _shutdown(threads, lamps):
+    _stop.set()
+    for t in threads:
+        t.join(timeout=2.0)
+    try:
+        _controller.reset()
+        _, off = _controller.snapshot()
+        lamps.apply(off)
+    except Exception as e:
+        print(f"[shutdown] lamp-off failed: {e!r}")
+    finally:
+        lamps.close()
+    print("[shutdown] workers stopped, lamps off, serial closed")
+    sys.stdout.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

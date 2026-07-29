@@ -31,10 +31,13 @@ falls back to the A55 CPU — expected, cheap).
 
 | file | role |
 |---|---|
-| `detect.py` | main app: capture thread + inference thread + FastAPI server |
+| `detect.py` | main app: capture + inference + control threads + FastAPI server |
 | `preprocess.py` | letterbox resize + normalization + dtype/quant conversion |
 | `postprocess.py` | built-in-postprocess reader (threshold + class-offset + unletterbox) |
-| `npu.py` | interpreter factory, optional Ethos-U delegate loader |
+| `interpreter.py` | interpreter factory, optional Ethos-U delegate loader |
+| `controller.py` | guided-sequence state machine (advance / fault / reset), pure logic |
+| `modbus.py` | Modbus-RTU indicator lamps (serial holding registers), called by the control thread |
+| `web/` | browser UI: `index.html` + `style.css` + `app.js` (vanilla JS + SSE) |
 | `config.py` | all config, hardcoded (single source of truth — edit this file) |
 | `dev_files/fake_server.py` | dev-box MJPEG server (loops a video / JPEGs / a still) |
 | `dev_files/capture.py` | standalone dataset-capture app for training images |
@@ -47,7 +50,7 @@ pip install -r requirements.txt
 ```
 
 `tflite-runtime` has no py3.12 wheel, so `requirements.txt` installs
-**`ai-edge-litert`**; `npu.py` auto-selects whichever is present
+**`ai-edge-litert`**; `interpreter.py` auto-selects whichever is present
 (`tflite_runtime` → `ai_edge_litert`).
 
 Run the mock camera + the app in two terminals:
@@ -62,20 +65,37 @@ python3 detect.py
 
 Open **http://localhost:8000/**. Endpoints:
 
-- `GET /` — HTML page with `<img src="/stream">`
+- `GET /` — demo page: live video (`<img src="/stream">`) + sequence side panel
 - `GET /stream` — `multipart/x-mixed-replace` annotated MJPEG
 - `GET /detections` — JSON `{label, class_id, score, box}`
+- `GET /state` — current demo state `{steps, current, complete, fault}`
+- `GET /events` — Server-Sent-Events stream of demo state (drives the panel)
+- `POST /reset` — reset the sequence to step 1 (also clears a fault)
+
+## Guided-sequence demo
+
+Present the objects in `config.DEMO_STEPS` (default `bottle → cell phone →
+scissors`) to the camera in order. Each confirmed object advances the side panel
+and lights its Modbus lamp; showing the wrong object freezes the sequence and
+lights the fault lamp until it's removed. The run auto-resets `AUTO_RESET_SECS`
+after completion, or on the Reset button. Detections must hold for
+`CONFIRM_FRAMES` inference cycles to count (debounce). With `MODBUS_ENABLE=False`
+(dev-box default) the lamp writes are just logged, so the whole demo runs with no
+gateway attached — no `pymodbus` needed until the board. Run the pure-logic
+tests with `python -m pytest tests/`.
 
 ## Board (NXP i.MX93, Ethos-U65)
 
 The vendor BSP already provides `tflite_runtime` + the Ethos-U delegate at
 `/usr/local/lib/libethosu_delegate.so`. Do **not** pip-install a tflite
-interpreter there; only the pure-Python deps are needed.
+interpreter there; only the pure-Python deps are needed. The Modbus lamps also
+need `pymodbus` (pure-Python): `pip install pymodbus` (pulls `pyserial`).
 
 ```bash
 sudo mkdir -p /opt/npu
-sudo cp detect.py preprocess.py postprocess.py npu.py config.py /opt/npu/
-sudo cp -r tflite_model /opt/npu/            # include the *_vela.tflite here
+sudo cp detect.py preprocess.py postprocess.py interpreter.py \
+        controller.py modbus.py config.py /opt/npu/
+sudo cp -r web tflite_model /opt/npu/        # web/ UI + the *_vela.tflite model
 ```
 
 Edit `/opt/npu/config.py` for the board:
@@ -86,10 +106,13 @@ MODEL_PATH  = "/opt/npu/tflite_model/ssd_mobilenet_v2_coco_quant_postprocess_vel
 USE_NPU     = True
 CAM_USER    = "<user>"
 CAM_PASS    = "<pass>"
+# Modbus-RTU indicator lamps:
+MODBUS_ENABLE = True
+MODBUS_PORT   = "/dev/ttyUSB0"   # + MODBUS_BAUD / PARITY / SLAVE to match the gateway
 ```
 
 Vela-compile the INT8 model (`vela ...`) to get the `_vela.tflite`. On load,
-`npu.py` logs input/output tensor details and the delegate init — confirm the
+`interpreter.py` logs input/output tensor details and the delegate init — confirm the
 backbone landed on the NPU. Then open `http://<board-ip>:8000/` from the LAN.
 
 ### Tuning (on the board only)
@@ -107,3 +130,11 @@ per-inference latency.
 - Capture is **latest-frame-wins**: no backlog, so latency stays bounded if
   inference or the network stalls.
 - No HTTP auth on the server — isolated LAN only.
+- `DEMO_STEPS` strings must match lines in `coco_labels_list.txt` exactly (e.g.
+  `cell phone`, not `phone`) — they're what the model emits.
+- Lamps are Modbus **holding registers** written `1`/`0` (`write_register`), not
+  coils — `STEP_REGS` / `FAULT_REG` are register addresses (see the gateway's Li
+  light map).
+- Only the control thread writes the Modbus bus. `/reset` resets the controller
+  and signals the control thread (via `_reset_flush`) to push the lamps off on
+  its next tick — so reset clears the lamps even if the detection stream stalls.
