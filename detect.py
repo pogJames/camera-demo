@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""Smart-camera -> NPU object detection -> LAN browser stream.
-
-Pulls an MJPEG stream, runs SSD-MobileNetV2 detection (CPU on the dev box,
-Ethos-U NPU on the board), draws boxes, and serves the annotated video as an
-MJPEG endpoint any browser can open with a plain <img>.
-
-Threads:
-  - capture thread : reads the MJPEG source, keeps only the LATEST frame.
-  - inference thread: every INFER_EVERY-th frame, runs the model; detections are
-                      cached and reused for in-between frames (rate decoupling).
-  - HTTP (uvicorn)  : serves / , /stream , /detections.
-
-Everything platform-specific is hardcoded in config.py (single source of truth).
-"""
+"""Smart-camera -> NPU object detection -> LAN browser stream. See CLAUDE.md."""
 
 import threading
 import time
@@ -27,22 +14,15 @@ import urllib3
 import config
 import preprocess
 import postprocess
-from interp import make_interpreter
+from npu import get_npu
 
-# Camera link is a self-signed isolated device; silence the verify=False warning.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class FrameStore:
-    """Latest-frame-wins slot shared between capture, inference, and HTTP.
-
-    Never queues a backlog: capture overwrites; consumers read the newest. This
-    keeps end-to-end latency bounded even if inference or the network stalls.
-    """
-
     def __init__(self):
         self._lock = threading.Lock()
-        self._frame = None          # latest full-res BGR frame
+        self._frame = None
         self._seq = 0
         self._detections = []
 
@@ -73,11 +53,6 @@ _stop = threading.Event()
 
 # Capture
 def _iter_mjpeg(resp, chunk=8192):
-    """Yield complete JPEG byte blobs from a multipart/x-mixed-replace stream.
-
-    Scans the raw byte stream for SOI (0xFFD8) .. EOI (0xFFD9) markers rather
-    than trusting the boundary string — robust across camera quirks.
-    """
     buf = bytearray()
     for data in resp.iter_content(chunk_size=chunk):
         if _stop.is_set():
@@ -88,14 +63,13 @@ def _iter_mjpeg(resp, chunk=8192):
         while True:
             soi = buf.find(b"\xff\xd8")
             if soi < 0:
-                # No start marker yet; keep only a tail to bound memory.
                 if len(buf) > chunk:
                     del buf[:-2]
                 break
             eoi = buf.find(b"\xff\xd9", soi + 2)
             if eoi < 0:
                 if soi > 0:
-                    del buf[:soi]   # drop junk before the start marker
+                    del buf[:soi]
                 break
             jpg = bytes(buf[soi:eoi + 2])
             del buf[:eoi + 2]
@@ -103,10 +77,6 @@ def _iter_mjpeg(resp, chunk=8192):
 
 
 def capture_loop():
-    """Connect to STREAM_URL and push decoded frames into the store, forever.
-
-    Reconnects with exponential backoff on any drop/error.
-    """
     auth = HTTPBasicAuth(config.CAM_USER, config.CAM_PASS) if config.CAM_USER else None
     decode_flag = {1: cv2.IMREAD_COLOR,
                    2: cv2.IMREAD_REDUCED_COLOR_2,
@@ -139,22 +109,13 @@ def capture_loop():
 
 # Inference
 class Detector:
-    """Wraps the interpreter for the built-in-postprocess (4-output) model.
-
-    The model's TFLite_Detection_PostProcess op emits pre-decoded, NMS'd boxes,
-    so inference is just: letterbox -> invoke -> threshold + class-offset + rescale.
-    """
-
     def __init__(self):
-        self.interp = make_interpreter(config.MODEL_PATH, config.USE_NPU)
-        self.inp = self.interp.get_input_details()[0]
-        self.outs = self.interp.get_output_details()
+        self.npu = get_npu(config.MODEL_PATH, config.USE_NPU)
+        self.inp = self.npu.get_input_details()[0]
+        self.outs = self.npu.get_output_details()
         self.input_size = int(self.inp["shape"][1])
         self.labels = postprocess.load_labels(config.LABELS_PATH)
 
-        # Standard TFLite_Detection_PostProcess outputs: boxes[1,N,4],
-        # classes[1,N], scores[1,N], count[1]. Identify by shape; use the tensor
-        # index order to break the classes-vs-scores tie (classes precede scores).
         boxes = [o for o in self.outs if len(o["shape"]) == 3 and o["shape"][-1] == 4]
         count = [o for o in self.outs if len(o["shape"]) == 1]
         pair = [o for o in self.outs if len(o["shape"]) == 2]
@@ -172,19 +133,18 @@ class Detector:
     def infer(self, frame_bgr):
         canvas, meta = preprocess.letterbox(frame_bgr, self.input_size)
         x = preprocess.to_input_tensor(canvas, self.inp)
-        self.interp.set_tensor(self.inp["index"], x)
-        self.interp.invoke()
+        self.npu.set_tensor(self.inp["index"], x)
+        self.npu.invoke()
         return postprocess.postprocess_builtin(
-            self.interp.get_tensor(self.box_idx)[0],
-            self.interp.get_tensor(self.class_idx)[0],
-            self.interp.get_tensor(self.score_idx)[0],
-            self.interp.get_tensor(self.count_idx)[0],
+            self.npu.get_tensor(self.box_idx)[0],
+            self.npu.get_tensor(self.class_idx)[0],
+            self.npu.get_tensor(self.score_idx)[0],
+            self.npu.get_tensor(self.count_idx)[0],
             meta, score_thres=config.SCORE_THRES, max_dets=config.MAX_DETS,
         )
 
 
 def inference_loop(detector):
-    """Run detection on every INFER_EVERY-th new frame; cache the result."""
     last_seq = -1
     counter = 0
     while not _stop.is_set():
@@ -239,7 +199,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 
 app = FastAPI(title="NPU camera detection")
-_labels = []   # populated in main()
+_labels = []
 
 _INDEX_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <title>NPU camera detection</title>
@@ -259,9 +219,6 @@ def _mjpeg_generator():
     last_seq = -1
     while not _stop.is_set():
         frame, seq = store.get_frame()
-        # Only annotate+encode when a NEW frame has arrived. Otherwise we'd
-        # re-encode the same frame ~100x/s (the loop rate) against a 15 fps
-        # source — pure wasted A55 JPEG-encode work. Wait for the next frame.
         if frame is None or seq == last_seq:
             time.sleep(0.005)
             continue

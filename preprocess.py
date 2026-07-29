@@ -1,20 +1,10 @@
-"""Frame preprocessing: letterbox resize + dtype/quantization to model input.
-
-Kept separate from detect.py so the full decode pipeline (letterbox -> invoke ->
-postprocess) can be exercised offline on a single image during dev-box
-validation, independent of the capture thread and HTTP server.
-"""
+"""Frame preprocessing: letterbox resize + quantization. See CLAUDE.md."""
 
 import cv2
 import numpy as np
 
 
 def letterbox(frame_bgr, input_size):
-    """Resize keeping aspect ratio and pad to a square input_size x input_size.
-
-    Returns (canvas_rgb_uint8, meta). meta lets postprocess map normalized box
-    coords back to the original full-res frame.
-    """
     oh, ow = frame_bgr.shape[:2]
     scale = min(input_size / ow, input_size / oh)
     nw, nh = int(round(ow * scale)), int(round(oh * scale))
@@ -38,27 +28,18 @@ def letterbox(frame_bgr, input_size):
 
 
 def to_input_tensor(canvas_rgb, input_detail, mean=127.5, std=127.5):
-    """Convert a uint8 RGB canvas to the model's (quantized) input tensor.
-
-    Normalize to SSD-MobileNet's [-1, 1] (norm = (pixel - mean) / std, defaults
-    mean=std=127.5), then quantize with the input tensor's own (scale, zero_point)
-    read straight from the model, clipped to the dtype's range so out-of-range
-    values can't wrap around. For the INT8 quant_postprocess model this round-trip
-    reproduces the raw [0,255] pixels its first op expects.
-    """
     dtype = np.dtype(input_detail["dtype"])
     norm = (canvas_rgb.astype(np.float32) - mean) / std
 
     scale, zero_point = input_detail["quantization"]
-    if not scale:  # no quantization params (scale 0/None) — raw cast
+    if not scale:
         x = np.clip(np.round(canvas_rgb), *_dtype_range(dtype)).astype(dtype)
     else:
         q = np.round(norm / scale + zero_point)
         x = np.clip(q, *_dtype_range(dtype)).astype(dtype)
-    return np.expand_dims(x, axis=0)   # add batch dim -> [1, S, S, 3]
+    return np.expand_dims(x, axis=0)
 
 
 def _dtype_range(dtype):
-    """(min, max) representable in an integer dtype, for clipping before cast."""
     info = np.iinfo(dtype)
     return info.min, info.max

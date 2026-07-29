@@ -1,13 +1,4 @@
-# Dev box (WSL / x86 Linux, Python 3.12). Install into a venv:
-#   python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
-#
-# The tflite interpreter is deliberately NOT pinned here as tflite-runtime,
-# because that wheel has no py3.12 build. interp.py imports whichever of these
-# is present, in order: tflite_runtime, ai_edge_litert, tensorflow.lite.
-#
-# On the NXP i.MX93 board image, tflite_runtime + the Ethos-U delegate are
-# already provided by the vendor BSP — do NOT pip-install a tflite interpreter
-# there; only the pure-Python deps below are needed.
+# See CLAUDE.md for install and board-vs-dev-box notes.
 
 numpy>=1.24
 opencv-python-headless>=4.8
@@ -15,6 +6,4 @@ requests>=2.31
 fastapi>=0.110
 uvicorn[standard]>=0.27
 
-# Dev-box interpreter (successor to tflite-runtime; provides ai_edge_litert).
-# Comment out on the board — the BSP supplies tflite_runtime there.
 ai-edge-litert>=1.0 ; platform_machine == "x86_64"

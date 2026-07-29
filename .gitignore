@@ -1,5 +1,9 @@
 __pycache__
 .venv
+
 data
-tflite_model
+dev_files
 testings
+tflite_model
+
+CLAUDE.md
