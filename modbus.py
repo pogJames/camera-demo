@@ -49,7 +49,7 @@ class LampBank:
         try:
             from pymodbus.client import ModbusSerialClient
             c = ModbusSerialClient(port=self.port, baudrate=9600, parity="N",
-                                   stopbits=1, bytesize=8, timeout=1.0)  # 9600 8N1
+                                   stopbits=1, bytesize=8, timeout=1.0)
             if not c.connect():
                 raise OSError(f"cannot open {self.port}")
             self._client = c

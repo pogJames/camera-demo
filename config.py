@@ -6,32 +6,32 @@ LABELS_PATH = "tflite_model/coco_labels_list.txt"
 
 USE_NPU     = True
 INFER_EVERY = 3
-
 SCORE_THRES = 0.5
 MAX_DETS    = 50
 
-CAM_USER    = ""
-CAM_PASS    = ""
+CAM_USER    = "admin"
+CAM_PASS    = "pixoel"
 VERIFY_TLS  = False
 
 HTTP_PORT   = 8000
 JPEG_QUALITY = 80
-
 CAPTURE_REDUCE = 1
 
-# Guided-sequence demo: labels must match lines in LABELS_PATH exactly.
 DEMO_STEPS   = ["bottle", "phone", "scissors"]
 CONFIRM_FRAMES = 3
 AUTO_RESET_SECS = 5
 
-# Modbus indicator lamps (RTU/serial, 9600 8N1, holding registers written 1/0).
-# Off = dev box, LampBank just logs. Register addresses per the gateway's Li map.
 MODBUS_ENABLE   = True
 MODBUS_PORT     = "/dev/ttyUSB0"
 MODBUS_SLAVE    = 1
-STEP_REGS       = [0x000D, 0x000E, 0x000F]   # Li0001..Li0003, index-aligned with DEMO_STEPS
-FAULT_REG       = 0x0010                       # Li0004
+STEP_REGS       = [0x000D, 0x000E, 0x000F]
+FAULT_REG       = 0x0010
 MODBUS_REFRESH_SECS = 2.0
+
+RECORD_ENABLE    = True
+RECORD_STREAM    = "Stream1"
+RECORD_PRE_SECS  = 2
+RECORD_POST_SECS = 1
 
 
 def summary():
@@ -50,5 +50,7 @@ def summary():
         f"MODBUS_ENABLE={MODBUS_ENABLE}  MODBUS_PORT={MODBUS_PORT}  "
         f"MODBUS_SLAVE={MODBUS_SLAVE}\n"
         f"STEP_REGS={[hex(r) for r in STEP_REGS]}  "
-        f"FAULT_REG={hex(FAULT_REG) if FAULT_REG is not None else None}"
+        f"FAULT_REG={hex(FAULT_REG) if FAULT_REG is not None else None}\n"
+        f"RECORD_ENABLE={RECORD_ENABLE}  RECORD_STREAM={RECORD_STREAM}  "
+        f"RECORD_PRE_SECS={RECORD_PRE_SECS}  RECORD_POST_SECS={RECORD_POST_SECS}"
     )

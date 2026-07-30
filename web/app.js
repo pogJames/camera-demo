@@ -5,7 +5,7 @@ function render(s) {
     const li = document.createElement('li');
     li.className = 'step ' + st.state;
     const proof = st.state === 'done'
-      ? '<a class="proof" href="/log/' + i + '" target="_blank">view</a>'
+      ? '<a class="proof" href="/log/' + i + '" target="_blank">clip</a>'
       : '';
     li.innerHTML = '<span class="dot"></span><span class="name">' +
       st.label + '</span>' + proof + '<span class="tick">&#10003;</span>';

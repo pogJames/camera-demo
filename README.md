@@ -37,6 +37,7 @@ falls back to the A55 CPU — expected, cheap).
 | `interpreter.py` | interpreter factory, optional Ethos-U delegate loader |
 | `controller.py` | guided-sequence state machine (advance / fault / reset), pure logic |
 | `modbus.py` | Modbus-RTU indicator lamps (serial holding registers), called by the control thread |
+| `camera.py` | uEye REST client: trigger event recording + fetch clip for the `/log` proxy |
 | `web/` | browser UI: `index.html` + `style.css` + `app.js` (vanilla JS + SSE) |
 | `config.py` | all config, hardcoded (single source of truth — edit this file) |
 | `dev_files/fake_server.py` | dev-box MJPEG server (loops a video / JPEGs / a still) |
@@ -70,7 +71,7 @@ Open **http://localhost:8000/**. Endpoints:
 - `GET /detections` — JSON `{label, class_id, score, box}`
 - `GET /state` — current demo state `{steps, current, complete, fault}`
 - `GET /events` — Server-Sent-Events stream of demo state (drives the panel)
-- `GET /log/{i}` — proof JPEG snapshotted when step `i` completed (404 if none)
+- `GET /log/{i}` — proxies the camera clip recorded when step `i` completed (404 if none)
 - `POST /reset` — reset the sequence to step 1 (also clears a fault)
 
 ## Guided-sequence demo
@@ -78,11 +79,13 @@ Open **http://localhost:8000/**. Endpoints:
 Present the objects in `config.DEMO_STEPS` (default `bottle → phone →
 scissors`) to the camera in order. Each confirmed object advances the side panel
 and lights its Modbus lamp; showing the wrong object freezes the sequence and
-lights the fault lamp until it's removed. Each completed step keeps a **proof
-snapshot** (the annotated frame that confirmed it), reachable via a "view" link
-on the step (`/log/{i}`). The run auto-resets `AUTO_RESET_SECS` after completion,
-or on the Reset button (which also clears the proofs). Detections must hold for
-`CONFIRM_FRAMES` inference cycles to count (debounce). With `MODBUS_ENABLE=False`
+lights the fault lamp until it's removed. Each completed step triggers a **camera
+clip** (uEye event recording), reachable via a "clip" link on the step
+(`/log/{i}`, proxied through this app). The clip finalizes ~`RECORD_POST_SECS`
+after the trigger, and is the raw `RECORD_STREAM` (no detection boxes). The run
+auto-resets `AUTO_RESET_SECS` after completion, or on the Reset button (which also
+clears the clip links). Detections must hold for `CONFIRM_FRAMES` inference cycles
+to count (debounce). With `MODBUS_ENABLE=False`
 (dev-box default) the lamp writes are just logged, so the whole demo runs with no
 gateway attached — no `pymodbus` needed until the board. Run the pure-logic
 tests with `python -m pytest tests/`.
@@ -97,7 +100,7 @@ need `pymodbus` (pure-Python): `pip install pymodbus` (pulls `pyserial`).
 ```bash
 sudo mkdir -p /opt/npu
 sudo cp detect.py preprocess.py postprocess.py interpreter.py \
-        controller.py modbus.py config.py /opt/npu/
+        controller.py modbus.py camera.py config.py /opt/npu/
 sudo cp -r web tflite_model /opt/npu/        # web/ UI + the *_vela.tflite model
 ```
 

@@ -19,6 +19,7 @@ import preprocess
 import postprocess
 import controller
 import modbus
+import camera
 import interpreter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -30,12 +31,11 @@ class FrameStore:
         self._frame = None
         self._seq = 0
         self._detections = []
-        self._infer_frame = None       # the frame the latest detections ran on
         self._det_seq = 0
         self._state = None
         self._state_seq = 0
         self._state_cond = threading.Condition(self._lock)
-        self._proofs = {}              # step index -> annotated JPEG bytes
+        self._proofs = {}
 
     def put_frame(self, frame):
         with self._lock:
@@ -49,10 +49,9 @@ class FrameStore:
                 return None, self._seq
             return self._frame.copy(), self._seq
 
-    def set_detections(self, dets, frame=None):
+    def set_detections(self, dets):
         with self._lock:
             self._detections = dets
-            self._infer_frame = frame
             self._det_seq += 1
 
     def get_detections(self):
@@ -61,12 +60,11 @@ class FrameStore:
 
     def get_detections_seq(self):
         with self._lock:
-            frame = None if self._infer_frame is None else self._infer_frame
-            return list(self._detections), frame, self._det_seq
+            return list(self._detections), self._det_seq
 
-    def set_proof(self, idx, jpg):
+    def set_proof(self, idx, name):
         with self._lock:
-            self._proofs[idx] = jpg
+            self._proofs[idx] = name
 
     def get_proof(self, idx):
         with self._lock:
@@ -79,7 +77,7 @@ class FrameStore:
     def set_state(self, state):
         with self._lock:
             if state == self._state:
-                return          # no change -> no seq bump, no wake (dedupe)
+                return
             self._state = state
             self._state_seq += 1
             self._state_cond.notify_all()
@@ -89,10 +87,6 @@ class FrameStore:
             return self._state
 
     def wait_state(self, last_seq, timeout):
-        """Block until state_seq != last_seq (pushed by set_state) or timeout.
-
-        Returns (state, state_seq). Latest-wins: coalesces bursts into one wake.
-        """
         with self._state_cond:
             if self._state_seq == last_seq:
                 self._state_cond.wait(timeout)
@@ -102,7 +96,7 @@ class FrameStore:
 store = FrameStore()
 _stop = threading.Event()
 _controller = None
-_reset_flush = threading.Event()   # /reset asks the control thread to push lamps off now
+_reset_flush = threading.Event()
 
 
 # Capture
@@ -216,27 +210,25 @@ def inference_loop(detector):
         except Exception as e:
             print(f"[infer] error: {e!r}")
             continue
-        store.set_detections(dets, frame)
+        store.set_detections(dets)
         dt = (time.time() - t0) * 1000
         if counter % (config.INFER_EVERY * 30) == 0:
             print(f"[infer] {len(dets)} dets, {dt:.1f}ms")
     print("[infer] stopped")
 
 
-# Sequence control (decoupled from inference; owns the Modbus lamps)
+# Sequence control
 def control_loop(ctrl, lamps):
     last_seq = -1
     last_current = 0
     while not _stop.is_set():
-        dets, frame, seq = store.get_detections_seq()
+        dets, seq = store.get_detections_seq()
         flush = _reset_flush.is_set()
         if seq == last_seq and not flush:
             _stop.wait(0.005)
             continue
         last_seq = seq
         if flush:
-            # ctrl was already reset by the HTTP handler; just push the off state,
-            # so the lamps clear even if the detection stream has stalled.
             _reset_flush.clear()
             state, regs = ctrl.snapshot()
         else:
@@ -246,31 +238,27 @@ def control_loop(ctrl, lamps):
         store.set_state(state)
         lamps.apply(regs)
 
-        # Proof-of-item: on each newly completed step, save the frame that
-        # confirmed it. On reset (current drops) drop the stale proofs.
         cur = state["current"]
         if cur > last_current:
             for i in range(last_current, cur):
-                _save_proof(i, ctrl.steps[i], frame, dets)
+                _trigger_recording(i)
         elif cur < last_current:
             store.clear_proofs()
         last_current = cur
     print("[control] stopped")
 
 
-def _save_proof(idx, label, frame, dets):
-    if frame is None:
+def _trigger_recording(idx):
+    if not config.RECORD_ENABLE:
         return
-    img = frame.copy()
-    hits = [d for d in dets if d["class_id"] < len(_labels)
-            and _labels[d["class_id"]] == label]
-    annotate(img, hits, _labels)
-    h, w = img.shape[:2]
-    if w > 480:
-        img = cv2.resize(img, (480, round(h * 480 / w)))
-    ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, config.JPEG_QUALITY])
-    if ok:
-        store.set_proof(idx, jpg.tobytes())
+    try:
+        name = camera.trigger(f"step{idx + 1}")
+    except Exception as e:
+        print(f"[camera] trigger step{idx + 1} failed: {e!r}")
+        return
+    if name:
+        store.set_proof(idx, name)
+        print(f"[camera] step{idx + 1} recording: {name}")
 
 
 # Annotation
@@ -357,10 +345,25 @@ def state():
 
 @app.get("/log/{i}")
 def log(i: int):
-    jpg = store.get_proof(i)
-    if jpg is None:
+    name = store.get_proof(i)
+    if not name:
         return Response(status_code=404)
-    return Response(content=jpg, media_type="image/jpeg")
+    try:
+        r = camera.open_video(name)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[camera] fetch {name} failed: {e!r}")
+        return Response(status_code=502)
+
+    def body():
+        try:
+            for chunk in r.iter_content(chunk_size=65536):
+                yield chunk
+        finally:
+            r.close()
+    return StreamingResponse(
+        body(), media_type="video/mp4",
+        headers={"Content-Disposition": f'inline; filename="{name}"'})
 
 
 @app.get("/events")
@@ -368,8 +371,6 @@ def events():
     def gen():
         last = -1
         while not _stop.is_set():
-            # Push: blocks until control_loop's set_state() notifies (or 15s
-            # keepalive). No polling; latency is the notify itself.
             s, seq = store.wait_state(last, timeout=15.0)
             if seq != last and s is not None:
                 last = seq
@@ -385,7 +386,7 @@ def reset():
         _controller.reset()
         st, _ = _controller.snapshot()
         store.set_state(st)
-        _reset_flush.set()   # control thread turns the lamps off on its next tick
+        _reset_flush.set()
     return JSONResponse({"ok": True})
 
 
@@ -404,6 +405,9 @@ def main():
         config.MODBUS_REFRESH_SECS)
     st0, _ = _controller.snapshot()
     store.set_state(st0)
+
+    if config.RECORD_ENABLE:
+        camera.enable_recording()
 
     threads = [
         threading.Thread(target=capture_loop, name="capture", daemon=True),
