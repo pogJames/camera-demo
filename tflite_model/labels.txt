@@ -1,0 +1,10 @@
+fist
+one
+peace
+three
+four
+palm
+like
+dislike
+ok
+no_gesture

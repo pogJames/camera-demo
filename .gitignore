@@ -3,8 +3,6 @@ __pycache__
 .pytest_cache
 
 data
-dev_files
-tflite_model
 tests
 
 CLAUDE.md
