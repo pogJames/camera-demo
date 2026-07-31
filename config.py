@@ -19,7 +19,7 @@ CAPTURE_REDUCE = 1
 
 DEMO_STEPS   = ["bottle", "phone", "scissors"]
 CONFIRM_FRAMES = 3
-AUTO_RESET_SECS = 5
+AUTO_RESET_SECS = 20
 
 MODBUS_ENABLE   = True
 MODBUS_PORT     = "/dev/ttyUSB0"
