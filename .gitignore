@@ -1,11 +1,13 @@
 __pycache__
 .venv
 .pytest_cache
-
 data
-dev_files
-tflite_model
 tests
+
+# HAGRID models
+tflite_model/labels.txt
+tflite_model/best_int8.tflite
+tflite_model/best_int8_vela.tflite
 
 CLAUDE.md
 openapi.yaml
