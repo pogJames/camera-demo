@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 
-def letterbox(frame_bgr, input_size):
+def letterbox(frame_bgr, input_size, pad_value=114):
     oh, ow = frame_bgr.shape[:2]
     scale = min(input_size / ow, input_size / oh)
     nw, nh = int(round(ow * scale)), int(round(oh * scale))
@@ -12,7 +12,7 @@ def letterbox(frame_bgr, input_size):
 
     pad_x = (input_size - nw) // 2
     pad_y = (input_size - nh) // 2
-    canvas = np.zeros((input_size, input_size, 3), dtype=np.uint8)
+    canvas = np.full((input_size, input_size, 3), pad_value, dtype=np.uint8)
     canvas[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
 
     canvas_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
@@ -27,7 +27,7 @@ def letterbox(frame_bgr, input_size):
     return canvas_rgb, meta
 
 
-def to_input_tensor(canvas_rgb, input_detail, mean=127.5, std=127.5):
+def to_input_tensor(canvas_rgb, input_detail, mean=0.0, std=255.0):
     dtype = np.dtype(input_detail["dtype"])
     norm = (canvas_rgb.astype(np.float32) - mean) / std
 

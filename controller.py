@@ -35,8 +35,8 @@ class DemoController:
             if self._index >= n:
                 if self._done_at is None:
                     self._done_at = now
-#                elif self.auto_reset_secs and now - self._done_at >= self.auto_reset_secs:
-#                    self._reset_locked()
+                elif self.auto_reset_secs and now - self._done_at >= self.auto_reset_secs:
+                    self._reset_locked()
             else:
                 expected = self.steps[self._index]
                 completed = set(self.steps[:self._index])

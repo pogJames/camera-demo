@@ -1,34 +1,77 @@
-"""Postprocessing for the built-in-postprocess SSD-MobileNetV2 model. See CLAUDE.md."""
+"""Postprocessing for the raw YOLO detection head (DFL boxes + NMS). See CLAUDE.md."""
 
+import cv2
 import numpy as np
 
 
 def load_labels(path):
     with open(path) as f:
-        return [ln.strip() for ln in f]
+        return [ln.strip() for ln in f if ln.strip()]
 
 
-def postprocess_builtin(boxes, classes, scores, count, letterbox_meta,
-                        score_thres=0.5, max_dets=50, label_offset=1):
-    boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
-    classes = np.asarray(classes).reshape(-1)
-    scores = np.asarray(scores, dtype=np.float32).reshape(-1)
-    n = min(int(count), len(scores))
+def postprocess_yolo(levels, letterbox_meta, score_thres=0.25, iou_thres=0.45,
+                     max_dets=50, label_offset=0):
+    S = letterbox_meta["input_size"]
+    boxes, scores, class_ids = [], [], []
+
+    for grid, (box_logits, cls_logits) in levels.items():
+        stride = S / grid
+        cls = cls_logits.reshape(-1, cls_logits.shape[-1])
+        conf = _sigmoid(cls)
+        best = conf.max(axis=1)
+        keep = best >= score_thres
+        if not keep.any():
+            continue
+
+        reg = box_logits.reshape(-1, 4, box_logits.shape[-1] // 4)[keep]
+        ltrb = (_softmax(reg) * np.arange(reg.shape[-1], dtype=np.float32)).sum(axis=-1)
+
+        gy, gx = np.divmod(np.nonzero(keep)[0], grid)
+        cx, cy = gx + 0.5, gy + 0.5
+        boxes.append(np.stack([
+            (cx - ltrb[:, 0]) * stride,
+            (cy - ltrb[:, 1]) * stride,
+            (cx + ltrb[:, 2]) * stride,
+            (cy + ltrb[:, 3]) * stride,
+        ], axis=1))
+        scores.append(best[keep])
+        class_ids.append(conf[keep].argmax(axis=1))
+
+    if not boxes:
+        return []
+
+    boxes = np.concatenate(boxes)
+    scores = np.concatenate(scores)
+    class_ids = np.concatenate(class_ids)
+
+    wh = np.stack([boxes[:, 0], boxes[:, 1],
+                   boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]], axis=1)
+    idx = cv2.dnn.NMSBoxes(wh.tolist(), scores.tolist(), score_thres, iou_thres)
+    if len(idx) == 0:
+        return []
+    idx = np.asarray(idx).reshape(-1)
+    idx = idx[np.argsort(-scores[idx])][:max_dets]
 
     detections = []
-    for k in range(n):
-        if scores[k] < score_thres:
-            continue
-        ymin, xmin, ymax, xmax = boxes[k]
-        x1, y1, x2, y2 = _unletterbox(xmin, ymin, xmax, ymax, letterbox_meta)
+    for k in idx:
+        x1, y1, x2, y2 = _unletterbox(boxes[k, 0] / S, boxes[k, 1] / S,
+                                      boxes[k, 2] / S, boxes[k, 3] / S,
+                                      letterbox_meta)
         detections.append({
-            "class_id": int(classes[k]) + label_offset,
+            "class_id": int(class_ids[k]) + label_offset,
             "score": float(scores[k]),
             "box": (x1, y1, x2, y2),
         })
-        if len(detections) >= max_dets:
-            break
     return detections
+
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _softmax(x):
+    e = np.exp(x - x.max(axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
 
 
 def _unletterbox(xmin, ymin, xmax, ymax, meta):

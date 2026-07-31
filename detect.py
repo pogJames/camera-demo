@@ -6,7 +6,6 @@ import os
 import sys
 import threading
 import time
-import io
 
 import cv2
 import numpy as np
@@ -164,32 +163,35 @@ class Detector:
         self.input_size = int(self.inp["shape"][1])
         self.labels = postprocess.load_labels(config.LABELS_PATH)
 
-        boxes = [o for o in self.outs if len(o["shape"]) == 3 and o["shape"][-1] == 4]
-        count = [o for o in self.outs if len(o["shape"]) == 1]
-        pair = [o for o in self.outs if len(o["shape"]) == 2]
-        if not (len(boxes) == 1 and len(count) == 1 and len(pair) == 2):
+        self.levels = {}
+        for o in self.outs:
+            if len(o["shape"]) != 4:
+                continue
+            grid, ch = int(o["shape"][1]), int(o["shape"][-1])
+            kind = "cls" if ch == len(self.labels) else "box"
+            self.levels.setdefault(grid, {})[kind] = o
+        bad = [g for g, p in self.levels.items() if set(p) != {"box", "cls"}]
+        if not self.levels or bad:
             raise RuntimeError(
-                f"Wrong model; got shapes "
-                f"{[list(o['shape']) for o in self.outs]}"
+                f"Wrong model; got shapes {[list(o['shape']) for o in self.outs]}"
             )
-        pair.sort(key=lambda o: o["index"])
-        self.box_idx = boxes[0]["index"]
-        self.class_idx = pair[0]["index"]
-        self.score_idx = pair[1]["index"]
-        self.count_idx = count[0]["index"]
 
     def infer(self, frame_bgr):
         canvas, meta = preprocess.letterbox(frame_bgr, self.input_size)
         x = preprocess.to_input_tensor(canvas, self.inp)
         self.npu.set_tensor(self.inp["index"], x)
         self.npu.invoke()
-        return postprocess.postprocess_builtin(
-            self.npu.get_tensor(self.box_idx)[0],
-            self.npu.get_tensor(self.class_idx)[0],
-            self.npu.get_tensor(self.score_idx)[0],
-            self.npu.get_tensor(self.count_idx)[0],
-            meta, score_thres=config.SCORE_THRES, max_dets=config.MAX_DETS,
+        levels = {g: (self._dequant(p["box"]), self._dequant(p["cls"]))
+                  for g, p in self.levels.items()}
+        return postprocess.postprocess_yolo(
+            levels, meta, score_thres=config.SCORE_THRES,
+            iou_thres=config.NMS_IOU, max_dets=config.MAX_DETS,
         )
+
+    def _dequant(self, detail):
+        raw = self.npu.get_tensor(detail["index"])[0].astype(np.float32)
+        scale, zero_point = detail["quantization"]
+        return (raw - zero_point) * scale if scale else raw
 
 
 def inference_loop(detector):

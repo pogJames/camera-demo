@@ -1,31 +1,35 @@
 # Smart-camera → NPU object detection → LAN browser stream
 
-Pulls an MJPEG stream, runs **SSD-MobileNetV2** COCO detection (CPU on a dev box,
-**Arm Ethos-U65 NPU** on the NXP i.MX93 board), draws boxes, and serves the
-annotated video to any LAN browser via a plain `<img>` MJPEG endpoint.
+Pulls an MJPEG stream, runs **YOLO hand-gesture detection** trained on HaGRID
+(CPU on a dev box, **Arm Ethos-U65 NPU** on the NXP i.MX93 board), draws boxes,
+and serves the annotated video to any LAN browser via a plain `<img>` MJPEG
+endpoint.
 
 Pure Python: `requests` (capture) + `opencv` (decode/draw) + a tflite interpreter
 + `FastAPI`/`uvicorn` (serve). Design rationale lives in **`CLAUDE.md`**.
 
 ## Model
 
-One model: INT8 built-in-postprocess `ssd_mobilenet_v2_coco_quant_postprocess.tflite`.
+`best_int8.tflite` — a YOLO detector trained on **HaGRID**, 10 gesture classes
+(`labels.txt`: fist, one, peace, three, four, palm, like, dislike, ok,
+no_gesture).
 
-Its **4 output tensors** mean a built-in `TFLite_Detection_PostProcess` op — boxes
-are decoded + NMS'd (incl. cross-class) inside the graph:
+It's a **raw detection head**: 6 outputs, nothing decoded in-graph, 2 tensors per
+feature level:
 
 | tensor | shape | dtype | meaning |
 |---|---|---|---|
-| input | `[1,300,300,3]` | uint8 `(scale 1/128, zp 128)` | feed raw `[0,255]` px |
-| out 0 | `[1,N,4]` | float32 | boxes `(ymin,xmin,ymax,xmax)` normalized |
-| out 1 | `[1,N]` | float32 | class ids (0-indexed, background dropped) |
-| out 2 | `[1,N]` | float32 | scores, sorted desc |
-| out 3 | `[1]` | float32 | detection count |
+| input | `[1,256,256,3]` | int8 `(scale 1/255, zp -128)` | `[0,1]`-normalized px |
+| box ×3 | `[1,G,G,64]` | int8 | DFL logits — 4 sides × 16 bins |
+| cls ×3 | `[1,G,G,10]` | int8 | raw class logits (**not** sigmoid'd) |
 
-`postprocess_builtin()` thresholds, unletterboxes, and applies a **`+1` class
-offset** so ids index directly into `coco_labels_list.txt` (line 0 = `???`
-background). Being INT8, it **Vela-compiles for the Ethos-U** (the postprocess op
-falls back to the A55 CPU — expected, cheap).
+`G` ∈ {32, 16, 8} → strides 8/16/32, 1344 anchors total. `postprocess_yolo()`
+does the whole decode in numpy: sigmoid + threshold, then DFL softmax-expectation
+on survivors only, anchor decode, `cv2.dnn.NMSBoxes`, unletterbox. Thresholding
+first keeps the normal case at **~0.08 ms** (vs 3.4 ms for the invoke itself).
+
+`labels.txt` has **no background line**, so `label_offset` is `0`. Being INT8 it
+**Vela-compiles for the Ethos-U**; the decode is pure numpy on the A55.
 
 ## Files
 
@@ -33,7 +37,7 @@ falls back to the A55 CPU — expected, cheap).
 |---|---|
 | `detect.py` | main app: capture + inference + control threads + FastAPI server |
 | `preprocess.py` | letterbox resize + normalization + dtype/quant conversion |
-| `postprocess.py` | built-in-postprocess reader (threshold + class-offset + unletterbox) |
+| `postprocess.py` | YOLO head decode (sigmoid + threshold, DFL, anchors, NMS, unletterbox) |
 | `interpreter.py` | interpreter factory, optional Ethos-U delegate loader |
 | `controller.py` | guided-sequence state machine (advance / fault / reset), pure logic |
 | `modbus.py` | Modbus-RTU indicator lamps (serial holding registers), called by the control thread |
@@ -76,9 +80,9 @@ Open **http://localhost:8000/**. Endpoints:
 
 ## Guided-sequence demo
 
-Present the objects in `config.DEMO_STEPS` (default `bottle → phone →
-scissors`) to the camera in order. Each confirmed object advances the side panel
-and lights its Modbus lamp; showing the wrong object freezes the sequence and
+Present the gestures in `config.DEMO_STEPS` (default `one → peace → three`) to
+the camera in order. Each confirmed gesture advances the side panel
+and lights its Modbus lamp; showing the wrong gesture freezes the sequence and
 lights the fault lamp until it's removed. Each completed step triggers a **camera
 clip** (uEye event recording), reachable via a "clip" link on the step
 (`/log/{i}`, proxied through this app). The clip finalizes ~`RECORD_POST_SECS`
@@ -108,7 +112,7 @@ Edit `/opt/npu/config.py` for the board:
 
 ```python
 STREAM_URL  = "https://192.168.10.1/streaming/stream3/video.mjpeg"
-MODEL_PATH  = "/opt/npu/tflite_model/ssd_mobilenet_v2_coco_quant_postprocess_vela.tflite"
+MODEL_PATH  = "/opt/npu/tflite_model/best_int8_vela.tflite"
 USE_NPU     = True
 CAM_USER    = "<user>"
 CAM_PASS    = "<pass>"
@@ -136,8 +140,9 @@ per-inference latency.
 - Capture is **latest-frame-wins**: no backlog, so latency stays bounded if
   inference or the network stalls.
 - No HTTP auth on the server — isolated LAN only.
-- `DEMO_STEPS` strings must match lines in `coco_labels_list.txt` exactly (e.g.
-  `phone`, not `phone`) — they're what the model emits.
+- `DEMO_STEPS` strings must match lines in `labels.txt` exactly — they're what
+  the model emits. Classes not listed in `DEMO_STEPS` (notably `no_gesture`) are
+  ignored by the state machine: they can neither advance nor fault.
 - Lamps are Modbus **holding registers** written `1`/`0` (`write_register`), not
   coils — `STEP_REGS` / `FAULT_REG` are register addresses (see the gateway's Li
   light map).

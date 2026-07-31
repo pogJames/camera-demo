@@ -1,12 +1,13 @@
 """Single source of truth for all runtime configuration. See CLAUDE.md."""
 
 STREAM_URL  = "http://192.168.1.170/streaming/stream3/video.mjpeg"
-MODEL_PATH  = "tflite_model/ssd_mobilenet_v2_coco_quant_postprocess_vela.tflite"
-LABELS_PATH = "tflite_model/coco_labels_list.txt"
+MODEL_PATH  = "tflite_model/best_int8_vela.tflite"
+LABELS_PATH = "tflite_model/labels.txt"
 
 USE_NPU     = True
 INFER_EVERY = 3
-SCORE_THRES = 0.5
+SCORE_THRES = 0.25
+NMS_IOU     = 0.45
 MAX_DETS    = 50
 
 CAM_USER    = "admin"
@@ -17,9 +18,9 @@ HTTP_PORT   = 8000
 JPEG_QUALITY = 80
 CAPTURE_REDUCE = 1
 
-DEMO_STEPS   = ["bottle", "phone", "scissors"]
+DEMO_STEPS   = ["one", "peace", "three"]
 CONFIRM_FRAMES = 3
-AUTO_RESET_SECS = 5
+AUTO_RESET_SECS = 20
 
 MODBUS_ENABLE   = True
 MODBUS_PORT     = "/dev/ttyUSB0"
@@ -40,7 +41,7 @@ def summary():
         f"MODEL_PATH={MODEL_PATH}\n"
         f"LABELS_PATH={LABELS_PATH}\n"
         f"USE_NPU={USE_NPU}  INFER_EVERY={INFER_EVERY}  "
-        f"SCORE_THRES={SCORE_THRES}  MAX_DETS={MAX_DETS}\n"
+        f"SCORE_THRES={SCORE_THRES}  NMS_IOU={NMS_IOU}  MAX_DETS={MAX_DETS}\n"
         f"CAM_USER={CAM_USER!r}  CAM_PASS={'***' if CAM_PASS else ''!r}  "
         f"VERIFY_TLS={VERIFY_TLS}\n"
         f"HTTP_PORT={HTTP_PORT}  JPEG_QUALITY={JPEG_QUALITY}  "
