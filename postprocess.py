@@ -44,8 +44,9 @@ def postprocess_yolo(levels, letterbox_meta, score_thres=0.25, iou_thres=0.45,
     scores = np.concatenate(scores)
     class_ids = np.concatenate(class_ids)
 
-    wh = np.stack([boxes[:, 0], boxes[:, 1],
-                   boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]], axis=1)
+    offset = class_ids.astype(np.float32) * (boxes.max() + 1)
+    wh = np.stack([boxes[:, 0] + offset, boxes[:, 1] + offset,
+                     boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]], axis=1)
     idx = cv2.dnn.NMSBoxes(wh.tolist(), scores.tolist(), score_thres, iou_thres)
     if len(idx) == 0:
         return []
