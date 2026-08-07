@@ -17,6 +17,7 @@ import config
 import preprocess
 import postprocess
 import controller
+import spatial
 import modbus
 import camera
 import interpreter
@@ -37,16 +38,17 @@ class FrameStore:
         self._proofs = {}
 
     def put_frame(self, frame):
+        frame.flags.writeable = False  # consumers share this buffer; see CLAUDE.md
         with self._lock:
             self._frame = frame
             self._seq += 1
             return self._seq
 
-    def get_frame(self):
+    def get_frame(self, since=None):
         with self._lock:
-            if self._frame is None:
+            if self._frame is None or self._seq == since:
                 return None, self._seq
-            return self._frame.copy(), self._seq
+            return self._frame, self._seq
 
     def set_detections(self, dets):
         with self._lock:
@@ -125,11 +127,6 @@ def _iter_mjpeg(resp, chunk=8192):
 
 def capture_loop():
     auth = HTTPBasicAuth(config.CAM_USER, config.CAM_PASS) if config.CAM_USER else None
-    decode_flag = {1: cv2.IMREAD_COLOR,
-                   2: cv2.IMREAD_REDUCED_COLOR_2,
-                   4: cv2.IMREAD_REDUCED_COLOR_4,
-                   8: cv2.IMREAD_REDUCED_COLOR_8}.get(config.CAPTURE_REDUCE,
-                                                      cv2.IMREAD_COLOR)
     backoff = 1.0
     while not _stop.is_set():
         try:
@@ -142,7 +139,7 @@ def capture_loop():
                 backoff = 1.0
                 print("[capture] connected")
                 for jpg in _iter_mjpeg(resp):
-                    frame = cv2.imdecode(np.frombuffer(jpg, np.uint8), decode_flag)
+                    frame = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
                     if frame is not None:
                         store.put_frame(frame)
         except Exception as e:
@@ -183,10 +180,11 @@ class Detector:
         self.npu.invoke()
         levels = {g: (self._dequant(p["box"]), self._dequant(p["cls"]))
                   for g, p in self.levels.items()}
-        return postprocess.postprocess_yolo(
+        dets = postprocess.postprocess_yolo(
             levels, meta, score_thres=config.SCORE_THRES,
             iou_thres=config.NMS_IOU, max_dets=config.MAX_DETS,
         )
+        return spatial.mark(dets, self.labels, config.DEMO_STEPS, config.EXCLUSIVE_IOU)
 
     def _dequant(self, detail):
         raw = self.npu.get_tensor(detail["index"])[0].astype(np.float32)
@@ -198,8 +196,8 @@ def inference_loop(detector):
     last_seq = -1
     counter = 0
     while not _stop.is_set():
-        frame, seq = store.get_frame()
-        if frame is None or seq == last_seq:
+        frame, seq = store.get_frame(last_seq)
+        if frame is None:
             _stop.wait(0.005)
             continue
         last_seq = seq
@@ -234,9 +232,7 @@ def control_loop(ctrl, lamps):
             _reset_flush.clear()
             state, regs = ctrl.snapshot()
         else:
-            labels = {_labels[d["class_id"]] for d in dets
-                      if d["class_id"] < len(_labels)}
-            state, regs = ctrl.update(labels)
+            state, regs = ctrl.update(spatial.present(dets), spatial.visible(dets))
         store.set_state(state)
         lamps.apply(regs)
 
@@ -274,16 +270,17 @@ def _color(cid):
     return _COLORS[cid]
 
 
-def annotate(frame, dets, labels):
+def annotate(frame, dets, scale=1.0):
     for d in dets:
-        x1, y1, x2, y2 = d["box"]
+        x1, y1, x2, y2 = (int(v * scale) for v in d["box"])
         col = _color(d["class_id"])
-        name = labels[d["class_id"]] if d["class_id"] < len(labels) else str(d["class_id"])
+        inside = d.get("inside", True)
         cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2)
-        text = f"{name} {d['score']:.2f}"
+        where = f" in {inside}" if isinstance(inside, str) else ("" if inside else " outside")
+        text = f"{d['label']}{where} {d['score']:.2f}"
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1, 1)
-        cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 2, y1), col, -1)
-        cv2.putText(frame, text, (x1 + 1, y1 - 4),
+        cv2.rectangle(frame, (x1, y1), (x1 + tw + 2, y1 + th + 6), col, -1)
+        cv2.putText(frame, text, (x1 + 1, y1 + th + 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 1, cv2.LINE_AA)
     return frame
 
@@ -294,7 +291,6 @@ from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Res
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="NPU camera detection")
-_labels = []
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
@@ -309,12 +305,18 @@ def _mjpeg_generator():
     encode_params = [cv2.IMWRITE_JPEG_QUALITY, config.JPEG_QUALITY]
     last_seq = -1
     while not _stop.is_set():
-        frame, seq = store.get_frame()
-        if frame is None or seq == last_seq:
+        frame, seq = store.get_frame(last_seq)
+        if frame is None:
             time.sleep(0.005)
             continue
         last_seq = seq
-        annotate(frame, store.get_detections(), _labels)
+        scale = config.PREVIEW_SCALE
+        if scale < 1.0:
+            frame = cv2.resize(frame, None, fx=scale, fy=scale,
+                               interpolation=cv2.INTER_AREA)
+        else:
+            frame = frame.copy()
+        annotate(frame, store.get_detections(), scale)
         ok, jpg = cv2.imencode(".jpg", frame, encode_params)
         if not ok:
             continue
@@ -334,9 +336,9 @@ def stream():
 def detections():
     out = []
     for d in store.get_detections():
-        name = _labels[d["class_id"]] if d["class_id"] < len(_labels) else str(d["class_id"])
-        out.append({"label": name, "class_id": d["class_id"],
-                    "score": round(d["score"], 4), "box": list(d["box"])})
+        out.append({"label": d["label"], "class_id": d["class_id"],
+                    "inside": d["inside"], "score": round(d["score"], 4),
+                    "box": list(d["box"])})
     return JSONResponse(out)
 
 
@@ -394,14 +396,13 @@ def reset():
 
 # Entrypoint
 def main():
-    global _labels, _controller
+    global _controller
     print("[config]\n" + config.summary())
     detector = Detector()
-    _labels = detector.labels
 
     _controller = controller.DemoController(
-        config.DEMO_STEPS, config.CONFIRM_FRAMES, config.AUTO_RESET_SECS,
-        config.STEP_REGS, config.FAULT_REG)
+        config.DEMO_STEPS, config.MODBUS_REGISTERS, config.IDLE_STATE,
+        config.CONFIRM_FRAMES, config.REGRESS_FRAMES)
     lamps = modbus.LampBank(
         config.MODBUS_ENABLE, config.MODBUS_PORT, config.MODBUS_SLAVE,
         config.MODBUS_REFRESH_SECS)
