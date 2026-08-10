@@ -1,21 +1,56 @@
-# Smart-camera → NPU object detection → LAN browser stream
+# Complete Packaging Demo
 
-Pulls an MJPEG stream, runs **YOLO box/parts detection** (CPU on a dev box,
-**Arm Ethos-U65 NPU** on the NXP i.MX93 board), draws boxes, and serves the
-annotated video to any LAN browser via a plain `<img>` MJPEG endpoint.
+![demo](_demo.gif)
 
-On top of that it runs a **guided packing demo**: scan the box's barcode, then
-place matrix → foam → card inside and close it, with a browser side panel and
-four Modbus lamps tracking progress.
+A **guided packing demo** on Artila's Matrix-800: scan the box's barcode, then
+place matrix → foam → card inside and close it, while a browser panel and four
+Modbus lamps track progress. Detection runs on the **Ethos-U65 NPU**.
 
-Pure Python: `requests` (capture) + `opencv` (decode/draw) + a tflite interpreter
-+ `zxing-cpp` (barcode) + `FastAPI`/`uvicorn` (serve). Design rationale lives in
-**`CLAUDE.md`**.
+## Architecture
+
+```mermaid
+flowchart LR
+    CAM["<b>uEye camera</b><br/>MJPEG 1080p"]
+
+    subgraph APP["detect.py — 4 threads"]
+        direction TB
+        CAP["<b>CAPTURE</b><br/>JPEG decode"]
+        STORE[("<b>FrameStore</b><br/>frame · detections · state")]
+        INF["<b>INFERENCE</b><br/>letterbox → NPU compute → <br/> DFL decode → spatial logic"]
+        CTL["<b>CONTROL</b><br/>barcode gate → state machine"]
+        WEB["<b>HTTP</b> (uvicorn)"]
+
+        CAP -->|frame| STORE
+        STORE -->|frame| INF
+        INF -->|detections| STORE
+        STORE -->|detections| CTL
+        CTL -->|demo state| STORE
+        STORE --> WEB
+    end
+
+    LAMPS["<b>INDICATOR LIGHTS</b>"]
+    UI["<b>BROWSER</b><br/>annotated video + step panel"]
+
+    CAM --> CAP
+    CTL -->|Modbus-RTU| LAMPS
+    CTL -.->|record event| CAM
+    WEB -->|MJPEG + SSE| UI
+```
+
+| Python stack | role |
+|---|---|
+| `requests` | pulls the MJPEG stream and drives the camera's REST API |
+| `opencv` | JPEG decode/encode, letterbox, annotation, NMS |
+| `numpy` | YOLO model head decode (DFL, anchors, unletterbox) |
+| `tflite_runtime` / `ai-edge-litert` | model inference; the board's build carries the Ethos-U delegate |
+| `zxing-cpp` | Code 128 decoding |
+| `fastapi` + `uvicorn` | HTTP server: MJPEG stream, JSON state, SSE |
+| `pymodbus` + `pyserial` | RTU writes to the lamp gateway |
 
 ## Model
 
-`box_detector_y8n_int8_320.tflite` — a YOLOv8n detector, 5 classes
-(`box_detector.txt`: card, closed_box, foam, matrix, open_box).
+`box_detector_y8n_int8_320.tflite` — a YOLOv8n detector, 5 custom classes
+(`box_detector.txt`)
 
 It's a **raw detection head**: 6 outputs, nothing decoded in-graph, 2 tensors per
 feature level:
@@ -48,145 +83,91 @@ INT8 it **Vela-compiles for the Ethos-U**; the decode is pure numpy on the A55.
 | `spatial.py` | containment gate — an item counts only when it's inside its container |
 | `barcode.py` | Code 128 reader (zxing-cpp) for the closed-box crop |
 | `interpreter.py` | interpreter factory, optional Ethos-U delegate loader |
-| `controller.py` | sequence state machine (advance / error / regress / scan gate), pure logic |
+| `controller.py` | sequence state machine (load product / advance / error / regress), pure logic |
 | `modbus.py` | Modbus-RTU indicator lamps (serial holding registers), called by the control thread |
 | `camera.py` | uEye REST client: trigger event recording + fetch clip for the `/log` proxy |
 | `web/` | browser UI: `index.html` + `style.css` + `app.js` (vanilla JS + SSE) |
 | `config.py` | all config, hardcoded (single source of truth — edit this file) |
-| `tests/fake_server.py` | dev-box MJPEG server (loops a video / JPEGs / a still) |
-| `tests/capture.py` | standalone dataset-capture app for training images |
-| `tests/tune_barcode.py` | sweeps barcode crop/scale against the live camera, prints what works |
 
-## Dev box (WSL / x86 Linux, Python 3.12)
+## Running
 
 ```bash
+# dev box (WSL / x86, py3.12) — MODEL_PATH = non-vela, USE_NPU = False
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
+python detect.py
 ```
 
-`tflite-runtime` has no py3.12 wheel, so `requirements.txt` installs
-**`ai-edge-litert`**; `interpreter.py` auto-selects whichever is present
-(`tflite_runtime` → `ai_edge_litert`).
+Open **http://localhost:8000/** :
 
-Run the mock camera + the app in two terminals:
+| Endpoints |  |
+|---|---|
+| `GET /` | demo page — video + sequence panel |
+| `GET /stream` | annotated MJPEG (`multipart/x-mixed-replace`) |
+| `GET /detections` | `{label, class_id, inside, score, box}` |
+| `GET /state` | `{steps, current, loaded, complete, error, misplaced, scan, lamps}` |
+| `GET /events` | SSE stream of the same state — drives the panel |
+| `GET /log/{i}` | camera clip recorded when step `i` completed |
+| `POST /reset` | drop the product, wait for a new barcode |
 
-```bash
-# terminal 1 — serve any local media as MJPEG at :8080
-python3 tests/fake_server.py path/to/clip.mp4   # or a folder of *.jpg, or one still
+## The sequence
 
-# terminal 2 — point MODEL_PATH at the non-vela build and set USE_NPU=False
-python3 detect.py
-```
-
-Open **http://localhost:8000/**. Endpoints:
-
-- `GET /` — demo page: live video (`<img src="/stream">`) + sequence side panel
-- `GET /stream` — `multipart/x-mixed-replace` annotated MJPEG
-- `GET /detections` — JSON `{label, class_id, inside, score, box}`
-- `GET /state` — demo state `{steps, current, complete, error, misplaced, scan, lamps}`
-- `GET /events` — Server-Sent-Events stream of demo state (drives the panel)
-- `GET /log/{i}` — proxies the camera clip recorded when step `i` completed (404 if none)
-- `POST /reset` — reset the sequence to step 1 (also clears the scan and clips)
-
-## Guided packing demo
-
-Steps come from `config.DEMO_STEPS`, one dict each:
+**The barcode is the starting gate.** Until a closed box is scanned the panel is
+blank. The scan loads that product's recipe from `config.SPECS`; Reset clears it.
+An unknown code shows "not in catalog" and nothing runs — no verified recipe, no
+packing.
 
 ```python
-{"title": "Matrix in box", "label": "matrix", "container": "open_box", "state": "1100"}
+"C642660001": {
+  "sku": "Matrix-800", "name": ..., "features": [...],
+  "steps": [
+    {"title": "Open box",      "label": "open_box", "container": None,       "state": "1000"},
+    {"title": "Matrix in box", "label": "matrix",   "container": "open_box", "state": "1100"},
+  ]}
 ```
 
-- **`label`** — the model class that satisfies the step.
-- **`container`** — the item must be **fully inside** a detection of this class,
-  or it doesn't count. Holding the matrix beside the box does nothing.
-- **`state`** — the lamp pattern once the step is done, one bit per
-  `MODBUS_REGISTERS`. The last step's `"0000"` is how the lamps clear at the end.
-- **`kind: "scan"`** — also requires a decoded barcode. Step 0 will not complete
-  until the label reads, so the run can't start on an unidentified box.
+| key | meaning |
+|---|---|
+| `label` | model class that satisfies the step |
+| `container` | must be **fully inside** a detection of this class, or it doesn't count |
+| `state` | lamp pattern once the step is done, one bit per `MODBUS_REGISTERS` |
 
-Behaviour worth knowing:
+So each SKU carries its own bill of materials and lamp map, with no code change;
+every other key is rendered generically in the sidebar card.
 
-- **Wrong item** → red banner and the sequence freezes, until it's removed. An
-  item that's merely *visible* never errors; only one placed **in the box** does.
-- **Item removed** → the sequence steps back and dims that lamp. Only the last
-  completed step is re-checked, and only while the box is in view — otherwise
-  occlusion would undo correct work.
-- **Item visible but not inside** → amber "not inside the box" hint, so a stalled
-  sequence explains itself.
-- **Barcode** → `config.SPECS` maps the code to part detail, printed in the
-  sidebar; unknown codes still run, flagged "not in catalog".
-- Detections must hold for `CONFIRM_FRAMES` cycles to count, and be missing for
-  `REGRESS_FRAMES` to un-count.
-- Each completed step triggers a **camera clip** (uEye event recording), linked
-  from the step (`/log/{i}`, proxied). It finalizes ~`RECORD_POST_SECS` after the
-  trigger and is the raw `RECORD_STREAM` (no boxes).
-- Reset is the only way back to step 0 — no auto-reset.
+| situation | response |
+|---|---|
+| wrong item placed in the box | red banner, sequence freezes until removed |
+| item visible but not inside | amber "not inside the box" hint |
+| placed item taken back out | steps back, dims that lamp |
+| item merely visible, on the bench | ignored entirely |
+| box still closed after scanning | fine — that's the start state |
+| box closed early, mid-sequence | wrong item |
 
-With `MODBUS_ENABLE=False` the lamp writes are just logged, so the demo runs with
-no gateway attached. Run the pure-logic tests with `python -m pytest tests/`.
+Detections must hold `CONFIRM_FRAMES` cycles to count and be missing
+`REGRESS_FRAMES` to un-count. Regression only re-checks the **last** completed
+step, and only while the box is in view — otherwise occlusion would undo correct
+work. Each completed step triggers a camera clip, linked from the step.
 
-## Board (NXP i.MX93, Ethos-U65)
+`MODBUS_ENABLE = False` just logs the lamp writes, so the whole demo runs with no
+gateway attached. `python -m pytest tests/` runs the pure-logic tests.
 
-The vendor BSP already provides `tflite_runtime` + the Ethos-U delegate at
-`/usr/local/lib/libethosu_delegate.so`. Do **not** pip-install a tflite
-interpreter there. Also needed: `pymodbus` (lamps) and `zxing-cpp` (barcode) —
-both have prebuilt aarch64 wheels.
+## Gotchas & tuning
 
-```bash
-sudo mkdir -p /opt/npu
-sudo cp detect.py preprocess.py postprocess.py interpreter.py spatial.py \
-        barcode.py controller.py modbus.py camera.py config.py /opt/npu/
-sudo cp -r web tflite_model /opt/npu/        # web/ UI + the *_vela.tflite model
-```
-
-Copy **all** of them together — a stale `barcode.py` against a new `config.py`
-fails with a `TypeError` on every scan attempt.
-
-Edit `/opt/npu/config.py` for the board:
-
-```python
-STREAM_URL  = "https://192.168.10.1/streaming/stream3/video.mjpeg"   # must be 1080p
-MODEL_PATH  = "/opt/npu/tflite_model/box_detector_y8n_int8_320_vela.tflite"
-USE_NPU     = True
-CAM_USER    = "<user>"
-CAM_PASS    = "<pass>"
-MODBUS_ENABLE = True
-MODBUS_PORT   = "/dev/ttyUSB0"   # 9600 8N1 hardcoded; set MODBUS_SLAVE to match the gateway
-```
-
-Vela-compile the INT8 model (`vela ...`) to get the `_vela.tflite`. On load,
-`interpreter.py` logs input/output tensor details and the delegate init — confirm
-the backbone landed on the NPU. Then open `http://<board-ip>:8000/` from the LAN.
-
-### Tuning (on the board only)
-
-- **`INFER_EVERY`** (default 3) — how often the model runs; in-between frames
-  reuse the last detections. `[infer]` log lines report per-inference latency.
-- **Barcode** — run `python tests/tune_barcode.py` with the box in front of the
-  camera. It sweeps `BARCODE_CROP` × `BARCODE_SCALE` over captured frames and
-  prints read rate and worst-case time per combination; copy the winning row into
-  `config.py`. Worst case matters more than median: it's what occupies the
-  control thread while waiting. `[barcode] slow read:` warns above 200 ms.
-- **`PREVIEW_SCALE`** — shrinks the browser preview before encoding. Encode cost
-  is per connected viewer, so this is the lever if the stream lags with several
-  tabs open.
-
-## Notes / gotchas
-
-- **The stream must be 1080p.** At 720p the barcode is ~65×15 px at demo
-  distance and no amount of upscaling decodes it.
-- **Never** load a `_vela.tflite` with `USE_NPU=False` — the unresolved `ethos-u`
-  op fails to prepare. The dev box runs the plain INT8 model (every op on CPU).
-- `VERIFY_TLS=False` is acceptable only on the isolated camera link.
-- Capture is **latest-frame-wins**, and frames from the store are **read-only and
-  shared, not copied** — anything that draws must resize or copy first.
-  `put_frame` marks them non-writeable so a violation raises immediately.
-- No HTTP auth on the server — isolated LAN only.
-- `DEMO_STEPS` labels must match lines in `box_detector.txt` exactly. Classes not
-  listed are ignored by the state machine entirely.
-- Lamps are Modbus **holding registers** written `1`/`0` (`write_register`), not
-  coils — `MODBUS_REGISTERS` are register addresses (see the gateway's Li light
-  map). There is no fault lamp; wrong items are a UI error only.
-- Only the control thread writes the Modbus bus. `/reset` resets the controller
-  and signals the control thread (via `_reset_flush`) to push the lamps off on
-  its next tick — so reset clears the lamps even if the detection stream stalls.
+- **The stream must be 1080p.** At 720p the barcode is ~65×15 px at demo distance
+  and no upscaling recovers it.
+- **Never** load a `_vela.tflite` with `USE_NPU = False` — the unresolved
+  `ethos-u` op fails to prepare.
+- **Barcode:** run `python tests/tune_barcode.py` on the board with the box in
+  frame. It sweeps `BARCODE_CROP` × `BARCODE_SCALE` and ranks by **worst-case**
+  time — that's what occupies the control thread. `[barcode] slow read:` warns
+  above 200 ms.
+- **Lag:** `PREVIEW_SCALE` shrinks the browser preview before encoding, and encode
+  cost is per connected viewer. `INFER_EVERY` controls how often the model runs.
+- Frames from `FrameStore` are **read-only and shared, not copied** — anything
+  that draws must resize or copy first. `put_frame` marks them non-writeable so a
+  violation raises immediately.
+- Lamps are Modbus **holding registers** (`write_register`), not coils. No fault
+  lamp — wrong items are a UI error only. Only the control thread writes the bus;
+  `/reset` signals it via `_reset_flush` so lamps clear even if detections stall.
+- No HTTP auth and `VERIFY_TLS = False` — isolated LAN only.
