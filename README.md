@@ -88,19 +88,13 @@ for the invoke itself).
 # dev box (WSL / x86, py3.12) — MODEL_PATH = non-vela build, USE_NPU = False
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-python detect.py                       # http://localhost:8000/
-```
-
-```bash
-# board (i.MX93) — vendor BSP already has tflite_runtime + the Ethos-U delegate,
-# so pip only needs pymodbus (pulls pyserial)
-sudo mkdir -p /opt/npu
-sudo cp *.py /opt/npu/ && sudo cp -r web tflite_model /opt/npu/
+python detect.py
 ```
 
 Then set the board values in `config.py` (`STREAM_URL`, the `_vela` model,
-`USE_NPU`/`MODBUS_ENABLE` on, camera credentials) and open
-`http://<board-ip>:8000/`.
+`USE_NPU`/`MODBUS_ENABLE` on, camera credentials).
+
+Open `http://<board-ip>:8000/`:
 
 | endpoint | returns |
 |---|---|
