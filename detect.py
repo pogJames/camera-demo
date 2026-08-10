@@ -18,6 +18,7 @@ import preprocess
 import postprocess
 import controller
 import spatial
+import barcode
 import modbus
 import camera
 import interpreter
@@ -159,6 +160,7 @@ class Detector:
         self.outs = self.npu.get_output_details()
         self.input_size = int(self.inp["shape"][1])
         self.labels = postprocess.load_labels(config.LABELS_PATH)
+        self.containers = config.containers()
 
         self.levels = {}
         for o in self.outs:
@@ -184,7 +186,7 @@ class Detector:
             levels, meta, score_thres=config.SCORE_THRES,
             iou_thres=config.NMS_IOU, max_dets=config.MAX_DETS,
         )
-        return spatial.mark(dets, self.labels, config.DEMO_STEPS, config.EXCLUSIVE_IOU)
+        return spatial.mark(dets, self.labels, self.containers, config.EXCLUSIVE_IOU)
 
     def _dequant(self, detail):
         raw = self.npu.get_tensor(detail["index"])[0].astype(np.float32)
@@ -233,6 +235,7 @@ def control_loop(ctrl, lamps):
             state, regs = ctrl.snapshot()
         else:
             state, regs = ctrl.update(spatial.present(dets), spatial.visible(dets))
+            _try_scan(ctrl, state, dets)
         store.set_state(state)
         lamps.apply(regs)
 
@@ -244,6 +247,47 @@ def control_loop(ctrl, lamps):
             store.clear_proofs()
         last_current = cur
     print("[control] stopped")
+
+
+_scan_at = 0.0
+_scan_streak = (None, 0)
+
+
+def _try_scan(ctrl, state, dets):
+    global _scan_at, _scan_streak
+    if not config.BARCODE_ENABLE or state.get("scan"):
+        return
+    if time.time() - _scan_at < config.BARCODE_INTERVAL_SECS:
+        return
+
+    boxes = [d for d in dets if d["label"] == config.SCAN_LABEL]
+    frame, _ = store.get_frame()
+    if not boxes or frame is None:
+        return
+    box = max(boxes, key=lambda d: d["score"])["box"]
+    t0 = time.time()
+    try:
+        hit = barcode.read(frame, box, config.BARCODE_CROP, config.BARCODE_SCALE)
+    except Exception as e:
+        print(f"[barcode] read failed: {e!r}")
+        return
+    finally:
+        _scan_at = time.time()  # gap measured from the END of a slow attempt
+    dt = (time.time() - t0) * 1000
+    if dt > 200:
+        print(f"[barcode] slow read: {dt:.0f}ms")
+    if not hit:
+        _scan_streak = (None, 0)
+        return
+
+    code, fmt = hit
+    seen = _scan_streak[1] + 1 if _scan_streak[0] == code else 1
+    _scan_streak = (code, seen)
+    if seen >= config.CONFIRM_FRAMES:
+        specs = config.SPECS.get(code)
+        ctrl.load(code, fmt, specs)
+        print(f"[barcode] {code} ({fmt}) -> "
+              f"{specs['sku'] if specs else 'NOT IN CATALOG, no steps loaded'}")
 
 
 def _trigger_recording(idx):
@@ -401,7 +445,7 @@ def main():
     detector = Detector()
 
     _controller = controller.DemoController(
-        config.DEMO_STEPS, config.MODBUS_REGISTERS, config.IDLE_STATE,
+        config.MODBUS_REGISTERS, config.IDLE_STATE, config.SCAN_STATE,
         config.CONFIRM_FRAMES, config.REGRESS_FRAMES)
     lamps = modbus.LampBank(
         config.MODBUS_ENABLE, config.MODBUS_PORT, config.MODBUS_SLAVE,

@@ -1,7 +1,7 @@
 """Geometry gate: an item counts only when it sits inside its container. See CLAUDE.md."""
 
 
-def mark(dets, labels, steps, exclusive_iou):
+def mark(dets, labels, containers, exclusive_iou):
     kept = _resolve(dets, exclusive_iou)
     for d in kept:
         d["label"] = labels[d["class_id"]] if d["class_id"] < len(labels) else str(d["class_id"])
@@ -10,13 +10,8 @@ def mark(dets, labels, steps, exclusive_iou):
     for d in kept:
         by_label.setdefault(d["label"], []).append(d)
 
-    required = {}
-    for s in steps:
-        if s.get("container"):
-            required.setdefault(s["label"], s["container"])
-
     for d in kept:
-        container = required.get(d["label"])
+        container = containers.get(d["label"])
         if container is None:
             d["inside"] = True
             continue

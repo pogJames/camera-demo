@@ -4,54 +4,69 @@ import threading
 
 
 class DemoController:
-    def __init__(self, steps, registers, idle_state, confirm_frames, regress_frames):
-        self.steps = list(steps)
+    def __init__(self, registers, idle_state, scan_state, confirm_frames, regress_frames):
         self.registers = list(registers)
         self.idle_state = idle_state
+        self.scan_state = scan_state
         self.confirm_frames = max(1, int(confirm_frames))
         self.regress_frames = max(1, int(regress_frames))
-        self.labels = list(dict.fromkeys(s["label"] for s in self.steps))
-        self._validate()
+        self._validate(idle_state, scan_state)
         self._lock = threading.Lock()
         self._reset_locked()
 
-    def _validate(self):
+    def _validate(self, *patterns):
         n = len(self.registers)
-        for state in [self.idle_state] + [s["state"] for s in self.steps]:
+        for state in patterns:
             if len(state) != n or set(state) - set("01"):
-                raise ValueError(
-                    f"lamp pattern error: {state!r}")
+                raise ValueError(f"lamp pattern error: {state!r}")
 
     def _reset_locked(self):
+        self.steps = []
+        self.labels = []
         self._index = 0
         self._error = False
         self._error_got = None
         self._streak = {}
         self._miss = {}
+        self._outside = {}
         self._visible = set()
+        self._scan = None
 
     def reset(self):
         with self._lock:
             self._reset_locked()
 
+    def load(self, code, fmt=None, specs=None):
+        """Install a scanned product's step list. No steps -> nothing to run."""
+        steps = list((specs or {}).get("steps", ()))
+        self._validate(*[s["state"] for s in steps])
+        with self._lock:
+            self._reset_locked()
+            self.steps = steps
+            self.labels = list(dict.fromkeys(s["label"] for s in steps))
+            self._scan = {"code": code, "format": fmt, "specs": specs}
+
     def update(self, labels, visible=None):
         with self._lock:
+            if not self.steps:            # no product scanned yet
+                return self._state_locked(), self._regs_locked()
             self._visible = set(labels if visible is None else visible)
             present = self._confirmed_locked(labels)
             expected = self._expected_locked()
             completed = {s["label"] for s in self.steps[:self._index]}
-            wrong = present - {expected} - completed
+            wrong = (present - {expected} - completed) if self._index else set()
 
-            if wrong:
+            if expected in present:
+                self._error = False
+                self._error_got = None
+                self._index += 1
+            elif wrong:
                 self._error = True
                 self._error_got = sorted(wrong)[0]
             else:
                 self._error = False
                 self._error_got = None
-                if expected in present:
-                    self._index += 1
-                else:
-                    self._regress_locked(present)
+                self._regress_locked(present)
 
             return self._state_locked(), self._regs_locked()
 
@@ -64,6 +79,8 @@ class DemoController:
             seen = lab in labels # check if label is seen in the current frame
             self._streak[lab] = self._streak.get(lab, 0) + 1 if seen else 0
             self._miss[lab] = 0 if seen else self._miss.get(lab, 0) + 1
+            outside = not seen and lab in self._visible
+            self._outside[lab] = self._outside.get(lab, 0) + 1 if outside else 0
         return self._present_locked()
 
     def _expected_locked(self):
@@ -90,27 +107,32 @@ class DemoController:
         return {
             "steps": steps,
             "current": self._index,
-            "complete": self._index >= len(self.steps),
+            "loaded": bool(self.steps),
+            "complete": bool(self.steps) and self._index >= len(self.steps),
             "error": {"active": self._error,
                       "expected": self._expected_locked(),
                       "got": self._error_got},
             "misplaced": self._misplaced_locked(),
+            "scan": self._scan,
             "lamps": [{"name": f"L{i + 1}", "on": bit == "1"}
                       for i, bit in enumerate(self._pattern_locked())],
         }
 
     def _misplaced_locked(self):
-        expected = self._expected_locked()
-        if expected is None or self._error or expected in self._present_locked():
+        if self._error or not self.steps or self._index >= len(self.steps):
             return None
-        return expected if expected in self._visible else None
+        step = self.steps[self._index]
+        if not step.get("container"):  # a box state is never "inside" anything
+            return None
+        outside = self._outside.get(step["label"], 0) >= self.confirm_frames
+        return step["label"] if outside else None
 
     def _present_locked(self):
         return {lab for lab, n in self._streak.items() if n >= self.confirm_frames}
 
     def _pattern_locked(self):
         if self._index == 0:
-            return self.idle_state
+            return self.scan_state if self.steps else self.idle_state
         return self.steps[self._index - 1]["state"]
 
     def _regs_locked(self):
