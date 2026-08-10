@@ -98,7 +98,10 @@ pip install -r requirements.txt
 python detect.py
 ```
 
-Open **http://localhost:8000/** :
+Then set the board values in `config.py` (`STREAM_URL`, the `_vela` model,
+`USE_NPU`/`MODBUS_ENABLE` on, camera credentials).
+
+Open `http://<board-ip>:8000/`:
 
 | Endpoints |  |
 |---|---|
