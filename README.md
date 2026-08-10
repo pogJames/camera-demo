@@ -1,31 +1,73 @@
-# Smart-camera → NPU object detection → LAN browser stream
+# Object Sequence Demo
 
-Pulls an MJPEG stream, runs **SSD-MobileNetV2** COCO detection (CPU on a dev box,
-**Arm Ethos-U65 NPU** on the NXP i.MX93 board), draws boxes, and serves the
-annotated video to any LAN browser via a plain `<img>` MJPEG endpoint.
+![demo](_demo_basic.gif)
 
-Pure Python: `requests` (capture) + `opencv` (decode/draw) + a tflite interpreter
-+ `FastAPI`/`uvicorn` (serve). Design rationale lives in **`CLAUDE.md`**.
+A **guided-sequence demo** on Artila's Matrix-800: present everyday objects to
+the camera in a fixed order (`bottle → phone → scissors`) while a browser panel
+and Modbus lamps track progress. Detection runs on the **Ethos-U65 NPU** with an
+off-the-shelf COCO model — no training required.
+
+```mermaid
+flowchart LR
+    CAM["uEye camera<br/>MJPEG"]
+
+    subgraph APP["detect.py — 4 threads"]
+        direction TB
+        CAP["<b>capture</b><br/>JPEG decode"]
+        STORE[("<b>FrameStore</b><br/>frame · detections · state")]
+        INF["<b>inference</b><br/>letterbox → Ethos-U65<br/>→ built-in postprocess"]
+        CTL["<b>control</b><br/>object sequence state machine"]
+        WEB["<b>HTTP</b> (uvicorn)"]
+
+        CAP -->|frame| STORE
+        STORE -->|frame| INF
+        INF -->|detections| STORE
+        STORE -->|detections| CTL
+        CTL -->|demo state| STORE
+        STORE --> WEB
+    end
+
+    LAMPS["Modbus-RTU<br/>3 step lamps + fault"]
+    UI["browser<br/>annotated video + step panel"]
+
+    CAM --> CAP
+    CTL -->|register map| LAMPS
+    CTL -.->|record event| CAM
+    WEB -->|MJPEG + SSE| UI
+```
+
+| python stack | role |
+|---|---|
+| `requests` | pulls the MJPEG stream and drives the camera's REST API |
+| `opencv` | JPEG decode/encode, letterbox, annotation |
+| `numpy` | tensor prep and box scaling |
+| `tflite_runtime` / `ai-edge-litert` | model inference; the board's build carries the Ethos-U delegate |
+| `fastapi` + `uvicorn` | HTTP server: MJPEG stream, JSON state, SSE |
+| `pymodbus` + `pyserial` | RTU writes to the lamp gateway |
 
 ## Model
 
-One model: INT8 built-in-postprocess `ssd_mobilenet_v2_coco_quant_postprocess.tflite`.
+`ssd_mobilenet_v2_coco_quant_postprocess.tflite` — stock INT8 SSD-MobileNetV2,
+90 COCO classes (`coco_labels_list.txt`).
 
-Its **4 output tensors** mean a built-in `TFLite_Detection_PostProcess` op — boxes
-are decoded + NMS'd (incl. cross-class) inside the graph:
+Its **4 output tensors** mean the decode is **built into the graph** — a
+`TFLite_Detection_PostProcess` op does box decoding and NMS (including
+cross-class) before the tensors ever reach Python:
 
 | tensor | shape | dtype | meaning |
 |---|---|---|---|
-| input | `[1,300,300,3]` | uint8 `(scale 1/128, zp 128)` | feed raw `[0,255]` px |
-| out 0 | `[1,N,4]` | float32 | boxes `(ymin,xmin,ymax,xmax)` normalized |
+| input | `[1,300,300,3]` | uint8 `(scale 1/128, zp 128)` | raw `[0,255]` px |
+| out 0 | `[1,N,4]` | float32 | boxes `(ymin,xmin,ymax,xmax)`, normalized |
 | out 1 | `[1,N]` | float32 | class ids (0-indexed, background dropped) |
-| out 2 | `[1,N]` | float32 | scores, sorted desc |
+| out 2 | `[1,N]` | float32 | scores, sorted descending |
 | out 3 | `[1]` | float32 | detection count |
 
-`postprocess_builtin()` thresholds, unletterboxes, and applies a **`+1` class
-offset** so ids index directly into `coco_labels_list.txt` (line 0 = `???`
-background). Being INT8, it **Vela-compiles for the Ethos-U** (the postprocess op
-falls back to the A55 CPU — expected, cheap).
+So `postprocess_builtin()` only thresholds, unletterboxes, and applies a **`+1`
+class offset** — `coco_labels_list.txt` line 0 is the `???` background entry, so
+ids need shifting by one to index it directly.
+
+Being INT8 it **Vela-compiles for the Ethos-U**; the postprocess op falls back to
+the A55 CPU, which is expected and cheap.
 
 ## Files
 
@@ -33,114 +75,88 @@ falls back to the A55 CPU — expected, cheap).
 |---|---|
 | `detect.py` | main app: capture + inference + control threads + FastAPI server |
 | `preprocess.py` | letterbox resize + normalization + dtype/quant conversion |
-| `postprocess.py` | built-in-postprocess reader (threshold + class-offset + unletterbox) |
+| `postprocess.py` | built-in-postprocess reader (threshold + class offset + unletterbox) |
 | `interpreter.py` | interpreter factory, optional Ethos-U delegate loader |
-| `controller.py` | guided-sequence state machine (advance / fault / reset), pure logic |
+| `controller.py` | sequence state machine (advance / fault / auto-reset), pure logic |
 | `modbus.py` | Modbus-RTU indicator lamps (serial holding registers), called by the control thread |
 | `camera.py` | uEye REST client: trigger event recording + fetch clip for the `/log` proxy |
 | `web/` | browser UI: `index.html` + `style.css` + `app.js` (vanilla JS + SSE) |
 | `config.py` | all config, hardcoded (single source of truth — edit this file) |
-| `dev_files/fake_server.py` | dev-box MJPEG server (loops a video / JPEGs / a still) |
-| `dev_files/capture.py` | standalone dataset-capture app for training images |
 
-## Dev box (WSL / x86 Linux, Python 3.12)
+## Running
 
 ```bash
+# dev box (WSL / x86, py3.12) — MODEL_PATH = non-vela build, USE_NPU = False
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
+python detect.py
 ```
 
-`tflite-runtime` has no py3.12 wheel, so `requirements.txt` installs
-**`ai-edge-litert`**; `interpreter.py` auto-selects whichever is present
-(`tflite_runtime` → `ai_edge_litert`).
+Vela-compile the INT8 model (`vela ...`) to produce the `_vela.tflite` the board
+config expects — only the plain builds are committed here. Then set the board
+values in `config.py` (`STREAM_URL`, the `_vela` model, `USE_NPU`/`MODBUS_ENABLE`
+on, camera credentials).
 
-Run the mock camera + the app in two terminals:
+Open `http://<board-ip>:8000/`:
 
-```bash
-# terminal 1 — serve any local media as MJPEG at :8080
-python3 dev_files/fake_server.py path/to/clip.mp4   # or a folder of *.jpg, or one still
+| endpoint | returns |
+|---|---|
+| `GET /` | demo page — video + sequence panel |
+| `GET /stream` | annotated MJPEG (`multipart/x-mixed-replace`) |
+| `GET /detections` | `{label, class_id, score, box}` |
+| `GET /state` | `{steps, current, complete, fault}` |
+| `GET /events` | SSE stream of the same state — drives the panel |
+| `GET /log/{i}` | camera clip recorded when step `i` completed |
+| `POST /reset` | back to step 1, clears the fault and clip links |
 
-# terminal 2 — config.py defaults already point at the mock stream + CPU
-python3 detect.py
-```
+## The sequence
 
-Open **http://localhost:8000/**. Endpoints:
-
-- `GET /` — demo page: live video (`<img src="/stream">`) + sequence side panel
-- `GET /stream` — `multipart/x-mixed-replace` annotated MJPEG
-- `GET /detections` — JSON `{label, class_id, score, box}`
-- `GET /state` — current demo state `{steps, current, complete, fault}`
-- `GET /events` — Server-Sent-Events stream of demo state (drives the panel)
-- `GET /log/{i}` — proxies the camera clip recorded when step `i` completed (404 if none)
-- `POST /reset` — reset the sequence to step 1 (also clears a fault)
-
-## Guided-sequence demo
-
-Present the objects in `config.DEMO_STEPS` (default `bottle → phone →
-scissors`) to the camera in order. Each confirmed object advances the side panel
-and lights its Modbus lamp; showing the wrong object freezes the sequence and
-lights the fault lamp until it's removed. Each completed step triggers a **camera
-clip** (uEye event recording), reachable via a "clip" link on the step
-(`/log/{i}`, proxied through this app). The clip finalizes ~`RECORD_POST_SECS`
-after the trigger, and is the raw `RECORD_STREAM` (no detection boxes). The run
-auto-resets `AUTO_RESET_SECS` after completion, or on the Reset button (which also
-clears the clip links). Detections must hold for `CONFIRM_FRAMES` inference cycles
-to count (debounce). With `MODBUS_ENABLE=False`
-(dev-box default) the lamp writes are just logged, so the whole demo runs with no
-gateway attached — no `pymodbus` needed until the board. Run the pure-logic
-tests with `python -m pytest tests/`.
-
-## Board (NXP i.MX93, Ethos-U65)
-
-The vendor BSP already provides `tflite_runtime` + the Ethos-U delegate at
-`/usr/local/lib/libethosu_delegate.so`. Do **not** pip-install a tflite
-interpreter there; only the pure-Python deps are needed. The Modbus lamps also
-need `pymodbus` (pure-Python): `pip install pymodbus` (pulls `pyserial`).
-
-```bash
-sudo mkdir -p /opt/npu
-sudo cp detect.py preprocess.py postprocess.py interpreter.py \
-        controller.py modbus.py camera.py config.py /opt/npu/
-sudo cp -r web tflite_model /opt/npu/        # web/ UI + the *_vela.tflite model
-```
-
-Edit `/opt/npu/config.py` for the board:
+Steps are COCO class names in `config.DEMO_STEPS`, in order:
 
 ```python
-STREAM_URL  = "https://192.168.10.1/streaming/stream3/video.mjpeg"
-MODEL_PATH  = "/opt/npu/tflite_model/ssd_mobilenet_v2_coco_quant_postprocess_vela.tflite"
-USE_NPU     = True
-CAM_USER    = "<user>"
-CAM_PASS    = "<pass>"
-# Modbus-RTU indicator lamps:
-MODBUS_ENABLE = True
-MODBUS_PORT   = "/dev/ttyUSB0"   # 9600 8N1 hardcoded; set MODBUS_SLAVE to match the gateway
+DEMO_STEPS      = ["bottle", "phone", "scissors"]
+STEP_REGS       = [0x000D, 0x000E, 0x000F]   # one lamp per step
+FAULT_REG       = 0x0010
+CONFIRM_FRAMES  = 2
+AUTO_RESET_SECS = 20
 ```
 
-Vela-compile the INT8 model (`vela ...`) to get the `_vela.tflite`. On load,
-`interpreter.py` logs input/output tensor details and the delegate init — confirm the
-backbone landed on the NPU. Then open `http://<board-ip>:8000/` from the LAN.
+| situation | response |
+|---|---|
+| expected object held up | step completes, its lamp lights |
+| a later object shown early | red banner + fault lamp, sequence freezes |
+| wrong object removed | fault clears by itself, sequence resumes |
+| an already-completed object reappears | ignored |
+| any other COCO class (person, chair, …) | ignored entirely |
+| all steps done | complete, then auto-resets after `AUTO_RESET_SECS` |
 
-### Tuning (on the board only)
+An object must hold for `CONFIRM_FRAMES` inference cycles before it counts, so a
+single-frame misdetection can neither advance the sequence nor trip a fault.
+Each completed step triggers a camera clip (uEye event recording), linked from
+the step — it finalizes ~`RECORD_POST_SECS` after the trigger and is the raw
+`RECORD_STREAM`, so it has no detection boxes.
 
-`INFER_EVERY` (default 3) controls how often the model runs; in-between frames
-reuse the last detections. Tune it — plus the camera's `stream3` resolution/fps —
-on the board; dev-CPU timings don't transfer. `[infer]` log lines report
-per-inference latency.
+`MODBUS_ENABLE = False` just logs the lamp writes, so the whole demo runs with no
+gateway attached. `python -m pytest tests/` runs the pure-logic tests.
 
-## Notes / gotchas
+## Gotchas & tuning
 
-- **Never** load a `_vela.tflite` with `USE_NPU=False` — the unresolved `ethos-u`
-  op fails to prepare. The dev box runs the plain INT8 model (every op on CPU).
-- `VERIFY_TLS=False` is acceptable only on the isolated camera link.
-- Capture is **latest-frame-wins**: no backlog, so latency stays bounded if
+- **Never** load a `_vela.tflite` with `USE_NPU = False` — the unresolved
+  `ethos-u` op fails to prepare. The dev box runs the plain INT8 model.
+- `DEMO_STEPS` strings must match lines in `coco_labels_list.txt` exactly — the
+  file uses `phone`, not the `cell phone` you'll see in other COCO label lists.
+  Check the file before inventing a step.
+- **Tuning:** `INFER_EVERY` (default 3) controls how often the model runs;
+  in-between frames reuse the last detections. `CAPTURE_REDUCE` decodes camera
+  JPEGs at 1/2 or 1/4 scale, which cuts decode + encode cost sharply. Tune both
+  on the board — dev-CPU timings don't transfer. `[infer]` logs per-inference
+  latency.
+- `SCORE_THRES = 0.5` is higher than the YOLO branches' 0.25 — SSD is chattier at
+  low confidence, and a demo wants fewer phantom boxes.
+- Capture is **latest-frame-wins** — no backlog, so latency stays bounded if
   inference or the network stalls.
-- No HTTP auth on the server — isolated LAN only.
-- `DEMO_STEPS` strings must match lines in `coco_labels_list.txt` exactly (e.g.
-  `phone`, not `phone`) — they're what the model emits.
-- Lamps are Modbus **holding registers** written `1`/`0` (`write_register`), not
-  coils — `STEP_REGS` / `FAULT_REG` are register addresses (see the gateway's Li
-  light map).
-- Only the control thread writes the Modbus bus. `/reset` resets the controller
-  and signals the control thread (via `_reset_flush`) to push the lamps off on
-  its next tick — so reset clears the lamps even if the detection stream stalls.
+- Lamps are Modbus **holding registers** (`write_register`), not coils —
+  `STEP_REGS` / `FAULT_REG` are addresses from the gateway's Li light map. Only
+  the control thread writes the bus; `/reset` signals it via `_reset_flush` so
+  lamps clear even if detections stall.
+- No HTTP auth and `VERIFY_TLS = False` — isolated LAN only.
