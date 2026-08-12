@@ -1,6 +1,7 @@
 """Guided-sequence demo state machine (pure logic, no I/O). See CLAUDE.md."""
 
 import threading
+import time
 
 
 class DemoController:
@@ -31,6 +32,8 @@ class DemoController:
         self._outside = {}
         self._visible = set()
         self._scan = None
+        self._done_at = {}
+        self._loaded_at = None
 
     def reset(self):
         with self._lock:
@@ -45,6 +48,7 @@ class DemoController:
             self.steps = steps
             self.labels = list(dict.fromkeys(s["label"] for s in steps))
             self._scan = {"code": code, "format": fmt, "specs": specs}
+            self._loaded_at = time.time()
 
     def update(self, labels, visible=None):
         with self._lock:
@@ -59,6 +63,7 @@ class DemoController:
             if expected in present:
                 self._error = False
                 self._error_got = None
+                self._done_at[self._index] = time.time()
                 self._index += 1
             elif wrong:
                 self._error = True
@@ -73,6 +78,23 @@ class DemoController:
     def snapshot(self):
         with self._lock:
             return self._state_locked(), self._regs_locked()
+
+    def run_summary(self):
+        with self._lock:
+            if not self.steps or self._loaded_at is None:
+                return None
+            scan = self._scan or {}
+            return {
+                "code": scan.get("code"),
+                "sku": (scan.get("specs") or {}).get("sku"),
+                "started_at": self._loaded_at,
+                "step_count": len(self.steps),
+                "reached_idx": self._index,
+                "complete": self._index >= len(self.steps),
+                "steps": [{"idx": i, "title": self.steps[i]["title"],
+                           "done_at": self._done_at[i]}
+                          for i in range(self._index) if i in self._done_at],
+            }
 
     def _confirmed_locked(self, labels):
         for lab in self.labels:
@@ -98,12 +120,15 @@ class DemoController:
             return
         if self._miss.get(last["label"], 0) >= self.regress_frames:
             self._index -= 1
+            self._done_at.pop(self._index, None)
 
     def _state_locked(self):
         steps = []
         for i, s in enumerate(self.steps):
             state = "done" if i < self._index else ("active" if i == self._index else "pending")
-            steps.append({"title": s["title"], "label": s["label"], "state": state})
+            at = self._done_at.get(i)
+            steps.append({"title": s["title"], "label": s["label"], "state": state,
+                          "at": self._stamp(at)})
         return {
             "steps": steps,
             "current": self._index,
@@ -117,6 +142,12 @@ class DemoController:
             "lamps": [{"name": f"L{i + 1}", "on": bit == "1"}
                       for i, bit in enumerate(self._pattern_locked())],
         }
+
+    @staticmethod
+    def _stamp(at):
+        if not at:
+            return None
+        return time.strftime("%H:%M:%S", time.localtime(at)) + f".{int(at % 1 * 1000):03d}"
 
     def _misplaced_locked(self):
         if self._error or not self.steps or self._index >= len(self.steps):

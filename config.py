@@ -20,7 +20,7 @@ PREVIEW_SCALE = 0.5
 CONFIRM_FRAMES = 2
 REGRESS_FRAMES = 5
 
-IDLE_STATE = "0000"         # lamps while waiting for a barcode
+IDLE_STATE = "1111"         # lamps while waiting for a barcode
 SCAN_STATE = "0000"         # lamps once a product is loaded, before step 1
 SCAN_LABEL = "closed_box"   # the class whose crop is searched for a barcode
 EXCLUSIVE_IOU   = 0.6
@@ -73,6 +73,9 @@ MODBUS_PORT     = "/dev/ttyUSB0"
 MODBUS_REGISTERS = [0x000D, 0x000E, 0x000F, 0x0010]
 MODBUS_SLAVE    = 1
 MODBUS_REFRESH_SECS = 2.0
+
+RUNS_ENABLE = True
+RUNS_DB     = "data/runs.db"
 
 RECORD_ENABLE    = True
 RECORD_STREAM    = "Stream1"

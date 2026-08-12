@@ -22,6 +22,7 @@ import barcode
 import modbus
 import camera
 import interpreter
+import runs
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -71,6 +72,10 @@ class FrameStore:
     def get_proof(self, idx):
         with self._lock:
             return self._proofs.get(idx)
+
+    def get_proofs(self):
+        with self._lock:
+            return dict(self._proofs)
 
     def clear_proofs(self):
         with self._lock:
@@ -232,10 +237,12 @@ def control_loop(ctrl, lamps):
         last_seq = seq
         if flush:
             _reset_flush.clear()
+            _save_abandoned()  # stashed by /reset, written here: one DB writer
             state, regs = ctrl.snapshot()
         else:
             state, regs = ctrl.update(spatial.present(dets), spatial.visible(dets))
             _try_scan(ctrl, state, dets)
+            _events.observe(state)
         store.set_state(state)
         lamps.apply(regs)
 
@@ -243,10 +250,35 @@ def control_loop(ctrl, lamps):
         if cur > last_current:
             for i in range(last_current, cur):
                 _trigger_recording(i)
+            if state["complete"]:  # rising edge: the run just finished
+                _save_run(ctrl.run_summary(), store.get_proofs(), "complete")
         elif cur < last_current:
             store.clear_proofs()
         last_current = cur
     print("[control] stopped")
+
+
+_events = runs.EventLog()
+_pending_abandon = None
+_logged_start = None
+
+
+def _save_run(summary, proofs, outcome):
+    global _logged_start
+    if not summary or summary["started_at"] == _logged_start:
+        return
+    if outcome == "abandoned" and summary["reached_idx"] <= 0:
+        return  # scanned and dropped without opening the box; not a run
+    runs.save(summary, proofs, _events.flush(), outcome)
+    _logged_start = summary["started_at"]
+
+
+def _save_abandoned():
+    global _pending_abandon
+    pending, _pending_abandon = _pending_abandon, None
+    if pending:
+        _save_run(pending[0], pending[1], "abandoned")
+    _events.clear()
 
 
 _scan_at = 0.0
@@ -430,7 +462,9 @@ def events():
 
 @app.post("/reset")
 def reset():
+    global _pending_abandon
     if _controller is not None:
+        _pending_abandon = (_controller.run_summary(), store.get_proofs())
         _controller.reset()
         st, _ = _controller.snapshot()
         store.set_state(st)
@@ -453,6 +487,7 @@ def main():
     st0, _ = _controller.snapshot()
     store.set_state(st0)
 
+    runs.init()
     if config.RECORD_ENABLE:
         camera.enable_recording()
 
@@ -481,6 +516,7 @@ def _shutdown(threads, lamps):
     for t in threads:
         t.join(timeout=2.0)
     try:
+        _save_run(_controller.run_summary(), store.get_proofs(), "abandoned")
         _controller.reset()
         _, off = _controller.snapshot()
         lamps.apply(off)
@@ -488,6 +524,7 @@ def _shutdown(threads, lamps):
         print(f"[shutdown] lamp-off failed: {e!r}")
     finally:
         lamps.close()
+        runs.close()
     print("[shutdown] workers stopped, lamps off, serial closed")
     sys.stdout.flush()
     os._exit(0)

@@ -11,8 +11,10 @@ function render(s) {
     const proof = st.state === 'done'
       ? '<a class="proof" href="/log/' + i + '" target="_blank">clip</a>'
       : '';
-    li.innerHTML = '<span class="dot"></span><span class="name">' +
-      st.title + '</span>' + proof + '<span class="tick">&#10003;</span>';
+    const at = st.at ? '<span class="at">' + st.at + '</span>' : '';
+    li.innerHTML = '<span class="dot"></span><span class="text"><span class="name">' +
+      st.title + '</span>' + at + '</span>' + proof +
+      '<span class="tick">&#10003;</span>';
     stepsEl.appendChild(li);
   });
 
