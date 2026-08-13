@@ -160,6 +160,107 @@ def save(run, proofs, events, outcome, log=print):
         log(f"[runs] save failed: {e!r}")
 
 
+def _median(xs):
+    xs = sorted(xs)
+    if not xs:
+        return 0
+    n = len(xs)
+    return xs[n // 2] if n % 2 else round((xs[n // 2 - 1] + xs[n // 2]) / 2)
+
+
+def _step_title(code, idx):
+    steps = (config.SPECS.get(code) or {}).get("steps") or []
+    return steps[idx]["title"] if 0 <= idx < len(steps) else f"step {idx + 1}"
+
+
+def overview(day=None, sku=None, log=print):
+    empty = {"kpi": {"runs": 0, "complete": 0, "abandoned": 0, "clean": 0,
+                     "fpy": None, "median_ms": 0},
+             "skus": [], "days": [], "trend": [], "steps": [],
+             "pareto": [], "abandon": []}
+    try:
+        db = sqlite3.connect(f"file:{config.RUNS_DB}?mode=ro", uri=True)
+    except Exception as e:
+        log(f"[runs] overview unavailable: {e!r}")
+        return empty
+    try:
+        db.row_factory = sqlite3.Row
+        where, args = [], []
+        if day:
+            where.append("day = ?")
+            args.append(day)
+        if sku:
+            where.append("sku = ?")
+            args.append(sku)
+        cond = (" WHERE " + " AND ".join(where)) if where else ""
+
+        runs_rows = db.execute(
+            "SELECT id, code, sku, day, outcome, started_at, duration_ms,"
+            " step_count, reached_idx, event_count FROM run" + cond +
+            " ORDER BY started_at", args).fetchall()
+        if not runs_rows:
+            empty["skus"] = [r[0] for r in db.execute(
+                "SELECT DISTINCT sku FROM run ORDER BY sku")]
+            empty["days"] = [r[0] for r in db.execute(
+                "SELECT DISTINCT day FROM run ORDER BY day DESC")]
+            return empty
+
+        ids = [r["id"] for r in runs_rows]
+        marks = ",".join("?" * len(ids))
+        done = [r for r in runs_rows if r["outcome"] == "complete"]
+        clean = [r for r in done if r["event_count"] == 0]
+
+        splits = {}
+        for r in db.execute(
+                "SELECT idx, title, split_ms FROM run_step"
+                f" WHERE run_id IN ({marks})", ids):
+            splits.setdefault((r["idx"], r["title"]), []).append(r["split_ms"])
+        steps = [{"idx": k[0], "title": k[1], "n": len(v),
+                  "median_ms": _median(v)}
+                 for k, v in sorted(splits.items())]
+
+        pareto = [{"title": r["title"], "kind": r["kind"], "n": r["n"],
+                   "secs": round((r["ms"] or 0) / 1000, 1)}
+                  for r in db.execute(
+                      "SELECT title, kind, COUNT(*) n, SUM(duration_ms) ms"
+                      f" FROM run_event WHERE run_id IN ({marks})"
+                      " GROUP BY title, kind ORDER BY n DESC, ms DESC", ids)]
+        total = sum(p["n"] for p in pareto) or 1
+        acc = 0
+        for p in pareto:
+            acc += p["n"]
+            p["cum"] = round(acc * 100 / total)
+
+        abandon = {}
+        for r in runs_rows:
+            if r["outcome"] == "abandoned":
+                key = (r["reached_idx"], _step_title(r["code"], r["reached_idx"]))
+                abandon[key] = abandon.get(key, 0) + 1
+
+        return {
+            "kpi": {"runs": len(runs_rows), "complete": len(done),
+                    "abandoned": len(runs_rows) - len(done), "clean": len(clean),
+                    "fpy": round(len(clean) * 100 / len(runs_rows)),
+                    "median_ms": _median([r["duration_ms"] for r in done])},
+            "skus": [r[0] for r in db.execute(
+                "SELECT DISTINCT sku FROM run ORDER BY sku")],
+            "days": [r[0] for r in db.execute(
+                "SELECT DISTINCT day FROM run ORDER BY day DESC")],
+            "trend": [{"id": r["id"], "started_at": r["started_at"],
+                       "duration_ms": r["duration_ms"], "events": r["event_count"]}
+                      for r in done],
+            "steps": steps,
+            "pareto": pareto,
+            "abandon": [{"reached_idx": k[0], "title": k[1], "n": v}
+                        for k, v in sorted(abandon.items())],
+        }
+    except Exception as e:
+        log(f"[runs] overview failed: {e!r}")
+        return empty
+    finally:
+        db.close()
+
+
 def close():
     global _conn
     if _conn is not None:

@@ -377,6 +377,16 @@ def index():
     return FileResponse(os.path.join(WEB_DIR, "index.html"))
 
 
+@app.get("/runs")
+def runs_page():
+    return FileResponse(os.path.join(WEB_DIR, "runs.html"))
+
+
+@app.get("/api/runs")
+def api_runs(day: str = "", sku: str = ""):
+    return JSONResponse(runs.overview(day or None, sku or None))
+
+
 def _mjpeg_generator():
     encode_params = [cv2.IMWRITE_JPEG_QUALITY, config.JPEG_QUALITY]
     last_seq = -1

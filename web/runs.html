@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Packing runs</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="runs">
+    <header class="runs-head">
+      <h1>Packing runs</h1>
+      <div class="runs-filters">
+        <select id="f-day"></select>
+        <select id="f-sku"></select>
+        <a class="runs-link" href="/">Live view</a>
+      </div>
+    </header>
+
+    <section class="kpis" id="kpis"></section>
+
+    <section class="rcard">
+      <h2>Cycle time per run</h2>
+      <div class="plot"><canvas id="c-trend"></canvas></div>
+      <p class="empty" id="e-trend" hidden>No completed runs yet.</p>
+    </section>
+
+    <div class="rgrid">
+      <section class="rcard tall">
+        <h2>Time per step <span class="sub">median</span></h2>
+        <div class="plot"><canvas id="c-steps"></canvas></div>
+        <p class="empty" id="e-steps" hidden>No steps recorded yet.</p>
+      </section>
+
+      <section class="rcard">
+        <h2>Where operators go wrong <span class="sub">by frequency</span></h2>
+        <div class="plot"><canvas id="c-pareto"></canvas></div>
+        <p class="empty" id="e-pareto" hidden>No errors recorded — every run was clean.</p>
+      </section>
+
+      <section class="rcard">
+        <h2>Abandoned runs <span class="sub">step they stopped on</span></h2>
+        <div class="plot short"><canvas id="c-abandon"></canvas></div>
+        <p class="empty" id="e-abandon" hidden>No abandoned runs.</p>
+      </section>
+    </div>
+  </div>
+
+  <script src="/static/chart.umd.min.js"></script>
+  <script src="/static/runs.js"></script>
+</body>
+</html>
