@@ -1,10 +1,18 @@
-# Complete Packaging Demo
+# Edge Vision-Enabled Packing Guide System
 
 ![demo](_demo.gif)
 
-A **guided packing demo** on Artila's Matrix-800: scan the box's barcode, then
-place matrix → foam → card inside and close it, while a browser panel and four
-Modbus lamps track progress. Detection runs on the **Ethos-U65 NPU**.
+A ***real-time guided packing system*** that tells a worker what goes in the box next. 
+Scan the barcode, then place matrix → foam → card and close it — a screen shows the step 
+and four lamps light up as each one is done.
+
+Everything runs inside an IoT Gateway: a camera feeds video frames, a small AI model running on 
+the gateway's NPU recognises the objects, and the gateway controls the lamps + serves the webpage 
+shown above. Nothing leaves this system and the lamp instantly changes as the part lands.
+
+It's built to handle a real bench, not a perfect one. Put in the wrong part, hold one
+above the box instead of in it, take one back out, or close the lid too early — each
+has its own response on screen.
 
 ## Architecture
 
@@ -12,11 +20,11 @@ Modbus lamps track progress. Detection runs on the **Ethos-U65 NPU**.
 flowchart LR
     CAM["<b>uEye camera</b><br/>MJPEG 1080p"]
 
-    subgraph APP["detect.py — 4 threads"]
+    subgraph APP["IoT Gateway — 4 threads"]
         direction TB
         CAP["<b>CAPTURE</b><br/>JPEG decode"]
         STORE[("<b>FrameStore</b><br/>frame · detections · state")]
-        INF["<b>INFERENCE</b><br/>letterbox → NPU compute → <br/> DFL decode → spatial logic"]
+        INF["<b>INFERENCE</b><br/>queue → NPU compute → <br/> DFL decode → spatial logic"]
         CTL["<b>CONTROL</b><br/>barcode gate → state machine"]
         WEB["<b>HTTP</b> (uvicorn)"]
 
