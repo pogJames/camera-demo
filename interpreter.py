@@ -5,18 +5,13 @@ import numpy as np
 
 def _import_tflite():
     try:
-        import tflite_runtime.interpreter as tflite
-        return tflite, "tflite_runtime"
-    except ImportError:
-        pass
-    try:
         from ai_edge_litert import interpreter as tflite
         return tflite, "ai_edge_litert"
     except ImportError:
         pass
 
 
-ETHOSU_DELEGATE = "/usr/local/lib/libethosu_delegate.so"
+ETHOSU_DELEGATE = "/usr/local/lib/litert_delegate.so"
 
 
 def get_npu(model_path, use_npu, log=print):
