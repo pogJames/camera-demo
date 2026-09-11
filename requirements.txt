@@ -8,4 +8,4 @@ uvicorn[standard]>=0.27
 pymodbus>=3.5,<4                                                                                       
 pyserial>=3.5 
 
-ai-edge-litert>=1.0 ; platform_machine == "x86_64"
+ai-edge-litert==2.1.6
